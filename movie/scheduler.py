@@ -1,6 +1,7 @@
 import enum
 import os
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor as ThreadPool
 from queue import Empty, Queue, ShutDown
 from typing import Callable, Protocol
 
@@ -163,6 +164,24 @@ class Scheduler:
             raise RuntimeError("No available workers")
 
         return selected_worker
+
+
+class ThreadPoolScheduler(Scheduler):
+    def __init__(self) -> None:
+        self._cpu_count = os.cpu_count() or 1
+        self._pool = ThreadPool()
+
+    def schedule(self, task: Task) -> None:
+        try:
+            self._pool.submit(task)
+        except RuntimeError:
+            pass
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self._pool.shutdown(wait=True)
 
 
 class Worker:

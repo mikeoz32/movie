@@ -15,7 +15,7 @@ def test_actor_system_creation():
         def receive(
             self, context: ActorContext, message: str
         ) -> "AbstractBehavior | None":
-            print(f"Child message: {message}")
+            context.log.debug(f"Child message: {message}")
 
     class TestBehavior(AbstractBehavior[str]):
         def __init__(self, context: ActorContext[str]) -> None:
@@ -29,7 +29,7 @@ def test_actor_system_creation():
         def receive(
             self, context: ActorContext, message: str
         ) -> "AbstractBehavior | None":
-            print(f"Received message: {message}")
+            context.log.debug(f"Received message: {message}")
             self.child.tell(f"Forwarded: {message}")
 
     system = ActorSystem.create(TestBehavior.create(), "test-system")
@@ -68,7 +68,7 @@ def test_actor_system_load():
         def receive(
             self, context: ActorContext, message: str
         ) -> "AbstractBehavior | None":
-            print(f"Received message: {message}")
+            context.log.info(f"Received message: {message}")
             for child in self.children:
                 child.tell(f"{message}")
 
@@ -112,13 +112,30 @@ def test_actor_failed():
         def receive(
             self, context: ActorContext, message: str
         ) -> "AbstractBehavior | None":
-            print(f"Received message: {message}")
+            context.log.error(f"Received message: {message}")
             self.child.tell(f"Forwarded: {message}")
 
         def on_signal(self, context: ActorContext, message: SystemMessage) -> None:
-            print(f"Received system message: {message}")
+            context.log.info(f"Received system message: {message}")
 
     system = ActorSystem.create(TestBehavior.create(), "test-system")
     assert system is not None
     system.tell("Hello, Actor!")
+    system.stop()
+
+
+def test_functional_behavior():
+    def behavior(counter: int = 0) -> AbstractBehavior[int]:
+        def receive(context: ActorContext, msg: str) -> "AbstractBehavior[int]":
+            context.log.info(f"Message count: {counter}")
+            return behavior(counter + 1)
+
+        return Behaviors.receive(receive)
+
+    system = ActorSystem.create(behavior(), "functional-behavior-system")
+    assert system is not None
+    system.tell("Hello, Functional Actor!")
+    system.tell("Hello, Functional Actor!")
+    system.tell("Hello, Functional Actor!")
+    system.tell("Hello, Functional Actor!")
     system.stop()

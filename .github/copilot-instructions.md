@@ -3,7 +3,7 @@
 This repository implements a small, local-process Actor Model framework in Python (see `movie/`).
 Key components live under `movie/`: `actor.py`, `mailbox.py`, `scheduler.py`, `system_message.py`, and `types.py`.
 
-AI agents should treat this as a single-process, thread-driven actor runtime (no network, no external services).
+AI agents should treat this as a single-process, thread-driven actor runtime (no network, no external services yet).
 
 ## Big picture (what to read first)
 
@@ -29,15 +29,13 @@ Read the tests in `tests/` for concrete usage examples: `tests/actor_system_test
 
 ## Running the project and tests (developer workflow)
 
-- Python requirement: pyproject declares `requires-python = ">=3.13"`. Use a matching interpreter.
+- requires uv to be installed.
 - Install local package and test tools (PowerShell example):
 
 ```pwsh
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
-python -m pip install -e .
-python -m pip install pytest
+uv venv
+.\.venv\Scripts\activate
+uv sync --all-groups
 python -m pytest -q
 ```
 

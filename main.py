@@ -11,7 +11,9 @@ class IotSupervisor(AbstractBehavior[None]):
 
 
 def main():
-    ActorSystem.create(IotSupervisor.create(), "iot-supervisor")
+    system = ActorSystem.create(IotSupervisor.create(), "iot-supervisor")
+    system.tell(None)
+    system.stop()
 
 
 if __name__ == "__main__":

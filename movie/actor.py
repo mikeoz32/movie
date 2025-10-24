@@ -1,12 +1,12 @@
 import enum
+import queue
 from threading import RLock
-from typing import Callable, Dict, Generic, Protocol, TypeVar, cast, Any
+from typing import Callable, Dict, Generic, MutableMapping, Protocol, TypeVar, cast, Any
 import uuid
 from movie.scheduler import Scheduler, create_mailbox, Mailbox
 from movie.system_message import Failed, SystemMessage
 
-from logging import getLogger
-
+from logging import StreamHandler, getLogger, Formatter, handlers, LoggerAdapter
 
 MessageType = TypeVar("MessageType")
 
@@ -48,6 +48,24 @@ class ActorSystem(ActorRef[MessageType], Protocol):
 class InternalACtorSystem(ActorSystem[MessageType], Protocol): ...
 
 
+class ActorLogger(LoggerAdapter):
+    def set_context(self, ctx: "ActorContext") -> None:
+        self.ctx = ctx
+        self._path = "<unnamed>"
+        try:
+            self._path = ctx.get_self()._path  # type: ignore
+        except AttributeError:
+            pass
+
+    def process(
+        self, msg: Any, kwargs: MutableMapping[str, Any]
+    ) -> tuple[Any, MutableMapping[str, Any]]:
+        extra = kwargs.setdefault("extra", {})
+        extra.setdefault("actor_id", str(self.ctx.get_self().id))
+        extra.setdefault("actor_path", self._path)  # якщо є ім’я
+        return msg, kwargs
+
+
 class ActorSystemImpl(ActorSystem[MessageType]):
     l = RLock()
 
@@ -66,16 +84,37 @@ class ActorSystemImpl(ActorSystem[MessageType]):
     def __init__(self, root_behavior: "AbstractBehavior", name: str) -> None:
         self._scheduler = Scheduler()
         self._root_behavior = root_behavior
-        self._root_ref: ActorRef | None = None
+        self._root_ref: ActorRef | None
         self._name = name
 
         self._actors: Dict[uuid.UUID, "LocalActorContext"] = {}
 
-        self._logger = getLogger(f"ActorSystem({name})")
+        self._log_queue = queue.Queue(maxsize=100_000)
+        self._log_listener: handlers.QueueListener | None = None
 
-    @property
-    def log(self):
-        return self._logger
+        self.setup_logger()
+
+    def actor_logger(self, ctx: "ActorContext") -> ActorLogger:
+        logger = ActorLogger(getLogger("actor"), {})
+        logger.set_context(ctx)
+        logger.setLevel("DEBUG")
+        return logger
+
+    def setup_logger(self) -> None:
+        stream = StreamHandler()
+        stream.setFormatter(
+            Formatter(
+                "[%(asctime)s %(levelname)s] %(name)s"
+                "(%(actor_id)s) %(actor_path)s -> %(message)s"
+            )
+        )
+
+        self._log_listener = handlers.QueueListener(self._log_queue, stream)
+        self._log_listener.start()
+
+        root = getLogger()
+        root.setLevel("DEBUG")
+        root.addHandler(handlers.QueueHandler(self._log_queue))
 
     def start(self) -> None:
         self._scheduler.start()
@@ -84,6 +123,8 @@ class ActorSystemImpl(ActorSystem[MessageType]):
 
     def stop(self) -> None:
         self._scheduler.stop()
+        if self._log_listener is not None:
+            self._log_listener.stop()
 
     def spawn(
         self,
@@ -131,8 +172,6 @@ class LocalActorRef(ActorRef[MessageType]):
     def tell_system(self, message: SystemMessage) -> None:
         with self._lock:
             context = self._system.get_context(self)
-            print("TELL SYSTEM", message)
-            print("CONTEXT", context)
             if context is not None:
                 if context._mailbox is not None:
                     context._mailbox.sendSystem(message)
@@ -152,6 +191,9 @@ class ActorContext(Protocol, Generic[MessageType]):
     # Invokes behavior with message
     def invoke(self, message: MessageType) -> None: ...
     def invoke_system(self, message: SystemMessage) -> None: ...
+
+    @property
+    def log(self) -> ActorLogger: ...
 
 
 class InternalActorContext(ActorContext[MessageType], Protocol):
@@ -231,6 +273,24 @@ class Behaviors:
     ) -> AbstractBehavior:
         return DefferedBehavior(factory)
 
+    @staticmethod
+    def receive(
+        receive_fn: Callable[[ActorContext, MessageType], "AbstractBehavior | None"],
+    ) -> AbstractBehavior:
+        class _ReceiveBehavior(AbstractBehavior):
+            def receive(
+                self,
+                context: ActorContext,
+                message: MessageType,
+            ) -> "AbstractBehavior | None":
+                context.log.debug(f"Received message: {message}")
+                return receive_fn(context, message)
+
+        def setup(ctx: ActorContext) -> AbstractBehavior:
+            return _ReceiveBehavior(ctx)
+
+        return DefferedBehavior(setup)
+
 
 class LocalActorContext(InternalActorContext[MessageType]):
     l = RLock()
@@ -247,14 +307,18 @@ class LocalActorContext(InternalActorContext[MessageType]):
         self._parent: LocalActorRef | None
         self._mailbox: Mailbox | None = None
         self._children: Dict[uuid.UUID, LocalActorRef] = {}
+        self._log = system.actor_logger(self)
 
     def start(self) -> None:
         while isinstance(self._behavior, DefferedBehavior):
             self._behavior = self._behavior(self)
+        self._log.debug("started")
 
     def stop(self) -> None:
         if self._mailbox is not None:
             self._mailbox.stop()
+
+        self._log.debug("stopped")
 
     def attach_mailbox(self, mailbox: Mailbox) -> None:
         self._mailbox = mailbox
@@ -264,6 +328,10 @@ class LocalActorContext(InternalActorContext[MessageType]):
 
     def get_system(self) -> ActorSystem:
         return self._system
+
+    @property
+    def log(self) -> ActorLogger:
+        return self._log
 
     @property
     def ref(self) -> ActorRef[MessageType]:
@@ -282,13 +350,14 @@ class LocalActorContext(InternalActorContext[MessageType]):
     def invoke(self, message: MessageType) -> None:
         with self.l:
             try:
-                new_behavior = self._behavior.receive(self, message)
-                if (
-                    new_behavior is not None
-                    and new_behavior != self._behavior
-                    and not new_behavior.same
-                ):
-                    self._behavior = new_behavior
+                new_behavior = self._behavior.receive(self, message) or Behaviors.same
+                match new_behavior:
+                    case DefferedBehavior() as deferred:
+                        self._behavior = deferred(self)
+                    case SameBehavior():
+                        pass
+                    case _:
+                        self._behavior = new_behavior
             except Exception as e:
                 if self._parent is not None:
                     self._parent.tell_system(Failed(self._ref, e))
