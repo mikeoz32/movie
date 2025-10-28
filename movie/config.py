@@ -1,4 +1,8 @@
-from typing import Any, Dict
+from typing import Any, Dict, TypeVar, cast
+
+from movie.utils import ClassLoader
+
+T = TypeVar("T")
 
 
 def _merge_dicts(primary: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
@@ -139,6 +143,23 @@ class Config:
                     return default
             case _:
                 return default
+
+    def get_instance(self, path: str, cls: T) -> T | None:
+        """Retrieve a configuration value and ensure it is an instance of the specified class.
+
+        Args:
+            path (str): The dot-separated path to the configuration value.
+            cls (Type[T]): The expected class type.
+
+        Returns:
+            T | None: The configuration value as an instance of the specified class or None if not found or mismatched.
+        """
+        value = self.get(path)
+        match value:
+            case str() as class_path:
+                result = ClassLoader.load_class(class_path)
+                return cast(cls, result)
+        return None
 
     def has_path(self, path: str) -> bool:
         """Check if a configuration path exists.

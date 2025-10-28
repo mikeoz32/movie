@@ -26,7 +26,7 @@ default_config = Config(
         "movie": {
             "actor": {},
             "dispatcher": {
-                "default-dispatcher": "movie.dispatcher.impl.DefaultDispatcher",
+                "default-dispatcher": "movie.dispatch.worker_pool.WorkerPoolDispatcherImpl",
                 "internal-dispatcher": "movie.dispatcher.impl.DefaultDispatcher",
                 "system-dispatcher": "movie.dispatcher.impl.DefaultDispatcher",
             },
@@ -86,7 +86,9 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
             raise ValueError("Actor system has not been started yet")
 
     def __init__(self, root_behavior: AbstractBehavior, name: str) -> None:
-        self._config = Config.from_toml_file("movie.toml").with_fallback()
+        self._config: Config = Config.from_toml_file("movie.toml").with_fallback(
+            default_config
+        )
         self._scheduler = Scheduler()
         self._extensions = ExtensionRegisrty(self)
         self._root_behavior = root_behavior
@@ -99,6 +101,10 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         self._log_listener: handlers.QueueListener | None = None
 
         self.setup_logger()
+
+    @property
+    def config(self) -> Config:
+        return self._config
 
     def actor_logger(self, ctx: ActorContext) -> ActorLogger:
         logger = ActorLogger(getLogger("actor"), {})
