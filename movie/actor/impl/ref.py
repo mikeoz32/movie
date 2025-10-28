@@ -4,10 +4,10 @@ import uuid
 
 from movie.actor import ActorRef
 from movie.actor.message import MessageType
-from movie.actor.system import ActorSystem
 
 if TYPE_CHECKING:
     from movie.actor.impl.system import ActorSystemImpl
+    from movie.actor.system import ActorSystem
 
 
 class LocalActorRef(ActorRef[MessageType]):

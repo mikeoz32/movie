@@ -6,6 +6,7 @@ from movie.actor.behaviour import AbstractBehavior
 from movie.actor.context import ActorContext
 from movie.actor.message import MessageType
 from movie.actor.ref import ActorRef, InternalActorRef
+from movie.config import Config
 
 
 class ClassLoader:
@@ -54,6 +55,9 @@ class ActorSystem(ActorRef[MessageType], Protocol):
     def start(self) -> None: ...
 
     def stop(self) -> None: ...
+
+    @property
+    def config(self) -> Config: ...
 
     @staticmethod
     def create(behavior: AbstractBehavior[MessageType], name: str) -> "ActorSystem":

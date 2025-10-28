@@ -12,6 +12,7 @@ from movie.actor.logger import ActorLogger
 from movie.actor.message import MessageType
 from movie.actor.ref import ActorRef
 from movie.actor.system import InternalActorSystem
+from movie.config import Config
 from movie.scheduler import Scheduler, create_mailbox
 
 
@@ -19,6 +20,19 @@ class Extension(Protocol): ...
 
 
 E = TypeVar("E", bound=Extension)
+
+default_config = Config(
+    {
+        "movie": {
+            "actor": {},
+            "dispatcher": {
+                "default-dispatcher": "movie.dispatcher.impl.DefaultDispatcher",
+                "internal-dispatcher": "movie.dispatcher.impl.DefaultDispatcher",
+                "system-dispatcher": "movie.dispatcher.impl.DefaultDispatcher",
+            },
+        }
+    }
+)
 
 
 class ExtensionId(Generic[E]): ...
@@ -53,8 +67,7 @@ class ActorRegistry:
         self._user_guardian: ActorRef | None = None
         self._system_guardian: ActorRef | None = None
 
-    def start(self, system:"ActorSystemImpl") -> None:
-        ...
+    def start(self, system: "ActorSystemImpl") -> None: ...
 
 
 class ActorSystemImpl(InternalActorSystem[MessageType]):
@@ -73,6 +86,7 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
             raise ValueError("Actor system has not been started yet")
 
     def __init__(self, root_behavior: AbstractBehavior, name: str) -> None:
+        self._config = Config.from_toml_file("movie.toml").with_fallback()
         self._scheduler = Scheduler()
         self._extensions = ExtensionRegisrty(self)
         self._root_behavior = root_behavior

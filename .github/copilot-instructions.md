@@ -1,9 +1,8 @@
 ## Quick context
 
 This repository implements a small, local-process Actor Model framework in Python (see `movie/`).
-Key components live under `movie/`: `actor.py`, `mailbox.py`, `scheduler.py`, `system_message.py`, and `types.py`.
 
-AI agents should treat this as a single-process, thread-driven actor runtime (no network, no external services yet).
+AI agents should treat as extensible thread-driven actor runtime.
 
 ## Big picture (what to read first)
 
@@ -13,13 +12,19 @@ AI agents should treat this as a single-process, thread-driven actor runtime (no
 
 Read the tests in `tests/` for concrete usage examples: `tests/actor_system_test.py` shows how Behaviors are constructed and how `ActorSystem.create(...)` / `system.tell(...)` / `system.stop()` are used.
 
-## Important project-specific patterns
+## Important project-specific concepts
 
-- Behaviors are factory-like: classes define a static `create()` that returns `Behaviors.setup(factory)` (see tests and `actor.py`). The actor's constructor receives an `ActorContext`.
-- `AbstractBehavior.receive(self, context, message)` returns either a new behavior instance (state transition) or `None` to keep the same behavior. Implementations must be side-effecting via the provided `context` (spawn children, tell other actors, etc.).
-- `on_signal(self, context, message)` handles system messages (supervision, termination). System messages are sent via `ActorRef.tell_system(...)` in the implementation.
-- `LocalActorContext.start()` resolves `DefferedBehavior` by repeatedly calling the factory until a concrete `AbstractBehavior` is returned. Use `Behaviors.setup(...)` for lazy initialization.
-- Mailbox types are selectable via `create_mailbox(..., mailbox_type=MailboxType.DEFAULT)`; the two implementations are `DefaultMailbox` and `SingleMessageDispatchMailbox` in `scheduler.py` — they differ in dispatch strategy and threading semantics.
+### Actor Model basics
+
+- Actors are single-threaded: each actor has a mailbox that serializes message processing.
+- Actor is represented by `ActorRef` (an actor reference in actor registry), `ActorContext` (an actrual actor instance with behavior and state), and `AbstractBehavior` (the behavior logic).
+- ACtrors are organized into a tree structure: each actor has a parent (except the root actor) and can have multiple children. Parents monitor their children for failures (see `LocalActorContext.invoke` and `Failed` system messages).
+
+### Actor lifecycle
+- Actors are created when ActorContext object is instantiated and new ActorRef is issued.
+- Actor is started when it registers itself in actor registry and scheduler (so its mailbox is ready to receive messages and process them), and is linked to its parent actor(except for root actor).
+- Actor is in terminating state when it receives Terminate system message or its parent fails. In this state, actor processes all messages in mailbox, stops accepting new messages, and notifies its children to terminate. 
+- Actor is fully stopped when all children are stopped, mailbox is empty and unregistered from scheduler. 
 
 ## How messages are delivered
 
@@ -36,7 +41,7 @@ Read the tests in `tests/` for concrete usage examples: `tests/actor_system_test
 uv venv
 .\.venv\Scripts\activate
 uv sync --all-groups
-python -m pytest -q
+python -m pytest -qs
 ```
 
 - Primary test commands: `python -m pytest -q` (tests are under `tests/`). Tests instantiate `ActorSystem` and call `start/stop`, so expect thread activity.

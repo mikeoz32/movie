@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional, Protocol
+import uuid
 
 
 @dataclass(frozen=True)
@@ -26,10 +27,10 @@ class Address:
         return addr
 
 
-def split_name_and_uid(name: str) -> tuple[str, Optional[int]]:
+def split_name_and_uid(name: str) -> tuple[str, Optional[uuid.UUID]]:
     if "#" in name:
-        parts = name.rsplit("@", 1)
-        return parts[0], int(parts[1])
+        parts = name.rsplit("#", 1)
+        return parts[0], uuid.UUID(parts[1])
     else:
         return name, None
 
@@ -38,14 +39,14 @@ class ActorPath(Protocol):
     _address: Address
     _name: str
     _parent: Optional["ActorPath"]
-    _uid: Optional[int]
+    _uid: Optional[uuid.UUID]
 
     def __init__(
         self,
         address: Address,
         name: str,
         parent: Optional["ActorPath"] = None,
-        uid: Optional[int] = None,
+        uid: Optional[uuid.UUID] = None,
     ) -> None:
         self._address = address
         self._name = name
@@ -78,7 +79,9 @@ class RootActorPath(ActorPath):
 
 
 class ChildActorPath(ActorPath):
-    def __init__(self, name: str, parent: ActorPath, uid: Optional[int] = None) -> None:
+    def __init__(
+        self, name: str, parent: ActorPath, uid: Optional[uuid.UUID] = None
+    ) -> None:
         if "#" in name:
             raise ValueError("Name cannot contain '#' character")
         if "/" in name:

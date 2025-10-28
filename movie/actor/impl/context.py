@@ -19,7 +19,23 @@ from movie.scheduler import Mailbox
 if TYPE_CHECKING:
     from movie.actor.impl.system import ActorSystemImpl
 
-class LocalActorContext(InternalActorContext[MessageType]):
+
+class ChildrenMixin:
+    def __init__(self) -> None:
+        self._children: Dict[uuid.UUID, LocalActorRef] = {}
+        self._parent: LocalActorRef | None
+
+    def get_children(self) -> Dict[uuid.UUID, LocalActorRef]:
+        return self._children
+
+    def attach_child(self, child: InternalActorContext) -> None:
+        child.set_parent(self._ref)
+
+    def set_parent(self, parent: ActorRef) -> None:
+        self._parent = cast(LocalActorRef, parent)
+
+
+class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
     l = RLock()
 
     def __init__(
@@ -28,12 +44,11 @@ class LocalActorContext(InternalActorContext[MessageType]):
         ref: LocalActorRef[MessageType],
         system: ActorSystemImpl,
     ) -> None:
+        ChildrenMixin.__init__(self)
         self._behavior = behavior
         self._system = system
         self._ref = ref
-        self._parent: LocalActorRef | None
         self._mailbox: Mailbox | None = None
-        self._children: Dict[uuid.UUID, LocalActorRef] = {}
         self._log = system.actor_logger(self)
 
     def start(self) -> None:
@@ -67,12 +82,6 @@ class LocalActorContext(InternalActorContext[MessageType]):
     @property
     def system(self) -> ActorSystem:
         return self._system
-
-    def attach_child(self, child: InternalActorContext) -> None:
-        child.set_parent(self._ref)
-
-    def set_parent(self, parent: ActorRef) -> None:
-        self._parent = cast(LocalActorRef, parent)
 
     def invoke(self, message: MessageType) -> None:
         with self.l:
