@@ -85,7 +85,6 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         self._config: Config = Config.from_toml_file("movie.toml").with_fallback(
             default_config
         )
-        self._scheduler = Scheduler()
         self._extensions = ExtensionRegisrty(self)
         self._dispatchers = DispatcherManager(self._config)
         self._mailboxes = MailboxManager(self._config)
