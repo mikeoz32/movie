@@ -1,0 +1,9 @@
+
+from typing import Protocol
+
+
+class Mailbox(Protocol):
+    def send(self, message) -> None: ...
+    def sendSystem(self, message) -> None: ...
+    def stop(self) -> None: ...
+

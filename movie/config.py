@@ -200,3 +200,6 @@ class Config:
         """
         combined_dict = _merge_dicts(self._dict, fallback._dict)
         return Config(combined_dict)
+
+    def __repr__(self) -> str:
+        return f"Config({self._dict})"

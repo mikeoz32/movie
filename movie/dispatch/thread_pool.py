@@ -10,7 +10,7 @@ class ThreadPoolScheduler(InternalDispatcher):
         self._cpu_count = os.cpu_count() or 1
         self._pool = ThreadPoolExecutor(max_workers=self._cpu_count)
 
-    def schedule(self, task: Task) -> None:
+    def dispatch(self, task: Task) -> None:
         try:
             self._pool.submit(task)
         except RuntimeError:

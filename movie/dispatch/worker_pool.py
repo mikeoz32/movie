@@ -92,7 +92,7 @@ class WorkerPoolDispatcherImpl(WorkerPoolDispatcher):
         self._queue.join()
         self._queue.shutdown(True)
 
-    def schedule(self, task: Task) -> None:
+    def dispatch(self, task: Task) -> None:
         try:
             worker = self._min_loaded_worker()
             worker.submit(task)

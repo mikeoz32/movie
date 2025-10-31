@@ -13,7 +13,8 @@ from movie.actor.message import MessageType
 from movie.actor.ref import ActorRef
 from movie.actor.system import InternalActorSystem
 from movie.config import Config
-from movie.scheduler import Scheduler, create_mailbox
+from movie.dispatch.manager import DispatcherManager
+from movie.mailbox.manager import MailboxManager
 
 
 class Extension(Protocol): ...
@@ -25,11 +26,6 @@ default_config = Config(
     {
         "movie": {
             "actor": {},
-            "dispatcher": {
-                "default-dispatcher": "movie.dispatch.worker_pool.WorkerPoolDispatcherImpl",
-                "internal-dispatcher": "movie.dispatcher.impl.DefaultDispatcher",
-                "system-dispatcher": "movie.dispatcher.impl.DefaultDispatcher",
-            },
         }
     }
 )
@@ -91,6 +87,8 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         )
         self._scheduler = Scheduler()
         self._extensions = ExtensionRegisrty(self)
+        self._dispatchers = DispatcherManager(self._config)
+        self._mailboxes = MailboxManager(self._config)
         self._root_behavior = root_behavior
         self._root_ref: ActorRef | None
         self._name = name
@@ -129,12 +127,10 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         root.addHandler(handlers.QueueHandler(self._log_queue))
 
     def start(self) -> None:
-        self._scheduler.start()
-
         self._root_ref = self.spawn(self._root_behavior, self._name)
 
     def stop(self) -> None:
-        self._scheduler.stop()
+        self._dispatchers.stop_all()
         if self._log_listener is not None:
             self._log_listener.stop()
 
@@ -152,7 +148,9 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
                 parent = cast(LocalActorContext, parent)
                 parent.attach_child(cast(LocalActorContext, context))
 
-            mailbox = create_mailbox(self._scheduler, context)
+            mailbox = self._mailboxes.create_mailbox(
+                self._dispatchers.default_dispatcher, context
+            )
             context.attach_mailbox(mailbox)
             with self.l:
                 self._actors[ref.id] = context

@@ -34,10 +34,6 @@ def test_actor_system_creation():
 
     system = ActorSystem.create(TestBehavior.create(), "test-system")
     assert system is not None
-    assert (
-        system.config.get_string("movie.dispatcher.default-dispatcher")
-        == "movie.dispatch.worker_pool.WorkerPoolDispatcherImpl"
-    )
     system.tell("Hello, Actor!")
     system.stop()
 
