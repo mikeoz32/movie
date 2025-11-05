@@ -21,11 +21,18 @@ class ClassLoader:
 
 class ActorSystem(ActorRef[MessageType], Protocol):
     @dataclass(frozen=True)
+    class PreStart: ...
+
+    @dataclass(frozen=True)
     class PostStop:
         """
         System message indicating that the actor is stopped.
         Is sent from parent to child actors.
         """
+
+    class Stop: ...
+
+    class Terminate: ...
 
     @dataclass(frozen=True)
     class Terminated:
@@ -46,7 +53,7 @@ class ActorSystem(ActorRef[MessageType], Protocol):
         ref: ActorRef
         exception: Exception
 
-    SystemMessage = Union[PostStop, Terminated, Failed]
+    SystemMessage = Union[PreStart, PostStop, Terminated, Failed, Stop, Terminate]
 
     _impl: "type[ActorSystem] | None" = None
 

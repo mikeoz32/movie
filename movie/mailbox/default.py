@@ -42,6 +42,9 @@ class DefaultMailbox(Mailbox):
                 self._messages.task_done()
             except Empty:
                 break
+            except Exception:
+                self._system_messages.task_done()
+                raise
 
         while True:
             try:
@@ -50,4 +53,10 @@ class DefaultMailbox(Mailbox):
                 self._system_messages.task_done()
             except Empty:
                 break
-        self._scheduled = False
+            except Exception:
+                self._system_messages.task_done()
+                raise
+        if self._messages.qsize() > 0 or self._system_messages.qsize() > 0:
+            self._dispatcher.dispatch(self)
+        else:
+            self._scheduled = False

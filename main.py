@@ -137,6 +137,9 @@ class DeviceGroup(AbstractBehavior[DeviceGroupCommand]):
                             Device.create(self._group_id, device_id), device_id
                         )
                         self._devices[device_id] = device_actor
+                        context.log.info(
+                            f"Created device actor for {device_id} in group {group_id}"
+                        )
                     reply_to.tell(ResponseDeviceRegistered(self._devices[device_id]))
                 else:
                     context.log.warning(

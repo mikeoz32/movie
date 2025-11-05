@@ -1,3 +1,4 @@
+from threading import RLock
 import time
 from movie.actor import ActorSystem, AbstractBehavior, Behaviors, ActorContext
 from movie.system_message import SystemMessage
@@ -41,6 +42,7 @@ def test_actor_system_creation():
 def test_actor_system_load():
     class Child(AbstractBehavior[str]):
         receive_count = 0
+        l = RLock()
 
         def __init__(self, context: ActorContext[str]) -> None:
             super().__init__(context)
@@ -52,7 +54,8 @@ def test_actor_system_load():
         def receive(
             self, context: ActorContext, message: str
         ) -> "AbstractBehavior | None":
-            Child.receive_count += 1
+            with Child.l:
+                Child.receive_count += 1
 
     class TestBehavior(AbstractBehavior[str]):
         def __init__(self, context: ActorContext[str]) -> None:
@@ -80,6 +83,7 @@ def test_actor_system_load():
     start = time.perf_counter()
     system.tell("Hello, Actor!")
     system.tell("Hello, Actor!")
+    time.sleep(0.01)
     system.stop()
     end = time.perf_counter()
     print(f"Messages processed in : {end - start:.6f} секунд")

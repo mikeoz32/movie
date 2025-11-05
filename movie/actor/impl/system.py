@@ -1,15 +1,17 @@
 from logging import Formatter, StreamHandler, getLogger, handlers
 import queue
 from threading import RLock
+import time
 from typing import Any, Callable, Dict, Generic, Protocol, Type, TypeVar, cast
 import uuid
 from movie.actor import ActorSystem
 from movie.actor.behaviour import AbstractBehavior
 from movie.actor.context import ActorContext
-from movie.actor.impl.context import LocalActorContext
+from movie.actor.impl.context import LocalActorContext, StoppedState
 from movie.actor.impl.ref import LocalActorRef
 from movie.actor.logger import ActorLogger
 from movie.actor.message import MessageType
+from movie.actor.path import Address, RootActorPath
 from movie.actor.ref import ActorRef
 from movie.actor.system import InternalActorSystem
 from movie.config import Config
@@ -129,6 +131,13 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         self._root_ref = self.spawn(self._root_behavior, self._name)
 
     def stop(self) -> None:
+        self._root_ref.tell_system(ActorSystem.Stop())
+        while True:
+            match self.get_context(self._root_ref).state:
+                case StoppedState():
+                    break
+            time.sleep(0.1)
+
         self._dispatchers.stop_all()
         if self._log_listener is not None:
             self._log_listener.stop()
@@ -141,21 +150,29 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         parent: "ActorContext | None" = None,
     ) -> "ActorRef":
         with ActorSystemImpl.l:
-            ref = LocalActorRef(self, name)
-            context = LocalActorContext(behavior, ref, self)
-            if parent is not None:
-                parent = cast(LocalActorContext, parent)
-                parent.attach_child(cast(LocalActorContext, context))
-
-            mailbox = self._mailboxes.create_mailbox(
-                self._dispatchers.default_dispatcher, context
+            ref = LocalActorRef(
+                self,
+                (
+                    RootActorPath(Address("movie", self._name))
+                    if not parent
+                    else parent.get_self().path.child(name)
+                ),
             )
-            context.attach_mailbox(mailbox)
-            with self.l:
-                self._actors[ref.id] = context
+            context = LocalActorContext(
+                behavior, ref, self, cast(LocalActorContext, parent)
+            )
+            self._actors[ref.id] = context
             context.start()
             return ref
+
+    @property
+    def mailboxes(self) -> MailboxManager:
+        return self._mailboxes
 
     def get_context(self, ref: ActorRef) -> "LocalActorContext | None":
         with ActorSystemImpl.l:
             return self._actors.get(ref.id, None)
+
+    def unregister_actor(self, ref: ActorRef) -> None:
+        with ActorSystemImpl.l:
+            self._actors.pop(ref.id, None)

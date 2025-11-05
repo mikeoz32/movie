@@ -4,6 +4,7 @@ import uuid
 
 from movie.actor import ActorRef
 from movie.actor.message import MessageType
+from movie.actor.path import ActorPath
 
 if TYPE_CHECKING:
     from movie.actor.impl.system import ActorSystemImpl
@@ -11,7 +12,7 @@ if TYPE_CHECKING:
 
 
 class LocalActorRef(ActorRef[MessageType]):
-    def __init__(self, system: ActorSystemImpl, path: str) -> None:
+    def __init__(self, system: ActorSystemImpl, path: ActorPath) -> None:
         self._lock = RLock()
         self._system = system
         self._path = path
@@ -21,16 +22,22 @@ class LocalActorRef(ActorRef[MessageType]):
         with self._lock:
             context = self._system.get_context(self)
             if context is not None:
-                if context._mailbox is not None:
-                    context._mailbox.send(message)
+                context.send(message)
 
     def tell_system(self, message: ActorSystem.SystemMessage) -> None:
         with self._lock:
             context = self._system.get_context(self)
             if context is not None:
-                if context._mailbox is not None:
-                    context._mailbox.sendSystem(message)
+                context.send_system(message)
 
     @property
     def id(self) -> uuid.UUID:
         return self._id
+
+    @property
+    def name(self) -> str:
+        return self._path.name
+
+    @property
+    def path(self) -> ActorPath:
+        return self._path

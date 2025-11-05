@@ -55,10 +55,23 @@ class ActorPath(Protocol):
 
     def child(self, child: str) -> "ActorPath": ...
 
+    @property
+    def name(self) -> str:
+        return self._name
+
     def __truediv__(self, child: str) -> "ActorPath":
         return self.child(child)
 
     def elements(self) -> list[str]: ...
+
+    def __repr__(self) -> str:
+        return f"ActorPath(address={self._address}, path={'/'.join(self.elements())}, uid={self._uid})"
+
+    def __str__(self) -> str:
+        path_str = "/".join(self.elements())
+        if self._uid:
+            path_str += f"#{self._uid}"
+        return f"{self._address}{path_str}"
 
 
 class RootActorPath(ActorPath):
