@@ -3,6 +3,9 @@ from typing import Callable, Generic
 
 from movie.actor.context import ActorContext
 from movie.actor.message import MessageType
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from movie.actor.system import ActorSystem
 
 
 class BehaviorTag(enum.Enum):
@@ -39,7 +42,9 @@ class AbstractBehavior(Generic[MessageType]):
         self, context: ActorContext, message: MessageType
     ) -> "AbstractBehavior | None": ...
 
-    def on_signal(self, context: ActorContext, message: SystemMessage) -> None: ...
+    def on_signal(
+        self, context: ActorContext, message: ActorSystem.SystemMessage
+    ) -> None: ...
 
 
 class DefferedBehavior(AbstractBehavior):

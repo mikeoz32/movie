@@ -61,7 +61,7 @@ class Worker:
 class WorkerPoolDispatcherImpl(WorkerPoolDispatcher):
     def __init__(self) -> None:
         self._cpu_count = os.cpu_count() or 1
-        self._workers: list[Worker | None] = [None] * (self._cpu_count * 4)
+        self._workers: list[Worker | None] = [None] * (self._cpu_count)
         self._queue: Queue[Task] = Queue()
         self._rr_lock: Lock = Lock()
         self._rr_index: int = 0

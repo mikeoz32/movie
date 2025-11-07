@@ -184,7 +184,7 @@ class IotSupervisor(AbstractBehavior[None]):
 
 def main():
     system = ActorSystem.create(IotSupervisor.create(), "iot-supervisor")
-    time.sleep(0.1)
+    time.sleep(0.01)
     system.stop()
 
 

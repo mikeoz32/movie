@@ -1,6 +1,8 @@
+import enum
 from logging import info, log
+import re
 from threading import RLock
-from typing import TYPE_CHECKING, Dict, Generic, Protocol, cast
+from typing import TYPE_CHECKING, Any, Dict, Generic, Protocol, cast
 import uuid
 from movie.actor.behaviour import (
     AbstractBehavior,
@@ -79,10 +81,10 @@ class NewState(ActorState[MessageType]):
     """
 
     def start(self, context: "LocalActorContext") -> "ActorState":
-        return StartingState()
+        return State.STARTING.value
 
     def stop(self, context: "LocalActorContext") -> "ActorState":
-        return StoppedState()
+        return State.STOPPED.value
 
     def send(self, context: "LocalActorContext", message: MessageType) -> None:
         "TODO: stash messages"
@@ -159,7 +161,7 @@ class StartingState(ActorState):
             case ActorSystem.PreStart():
                 context.on_signal(message)
                 # context.log.info("Actor starting...")
-                return RunningState()
+                return State.RUNNING.value
             case _:
                 return self
 
@@ -200,7 +202,13 @@ class RunningState(ActorState):
         """
         Regular message handling.
         """
-        context.on_message(message)
+        try:
+            context.on_message(message)
+            return self
+        except Exception as e:
+            if context._parent is not None:
+                context._parent.tell_system(ActorSystem.Failed(context._ref, e))
+                return State.FAILED.value
 
     def invoke_system(
         self, context: "LocalActorContext", message: ActorSystem.SystemMessage
@@ -214,10 +222,9 @@ class RunningState(ActorState):
                 return self
             case ActorSystem.Stop():
                 # Initiate graceful shutdown
-                return StoppingState()
-            case _:
-                context.tell_system(message)
-                return self
+                return State.STOPPING.value
+        context.on_signal(message)
+        return self
 
 
 class StoppingState(ActorState):
@@ -248,7 +255,7 @@ class StoppingState(ActorState):
         return self
 
     def stop(self, context: "LocalActorContext") -> "ActorState":
-        return StoppedState()
+        return State.STOPPED.value
 
     def send(self, context: "LocalActorContext", message: MessageType) -> None:
         # Ignore messages during stopping
@@ -272,10 +279,10 @@ class StoppingState(ActorState):
                 context.remove_child(actor_ref)
                 if context.childern_count() == 0:
                     # All children stopped, can transition to stopped
-                    return StoppedState()
+                    return State.STOPPED.value
                 return self
             case ActorSystem.Terminate():
-                return StoppedState()
+                return State.STOPPED.value
 
 
 class StoppedState(ActorState):
@@ -341,7 +348,7 @@ class FailedState(ActorState):
         return self
 
     def stop(self, context: "LocalActorContext") -> "ActorState":
-        return StoppingState()
+        return State.STOPPING.value
 
     def send(self, context: "LocalActorContext", message: MessageType) -> None:
         pass
@@ -363,10 +370,19 @@ class FailedState(ActorState):
                 return self
             case ActorSystem.Stop():
                 # Initiate graceful shutdown
-                return StoppingState()
+                return State.STOPPING.value
             case _:
                 context.tell_system(message)
                 return self
+
+
+class State(enum.Enum):
+    NEW = NewState()
+    STARTING = StartingState()
+    RUNNING = RunningState()
+    STOPPING = StoppingState()
+    STOPPED = StoppedState()
+    FAILED = FailedState()
 
 
 class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
@@ -385,7 +401,7 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
         self._ref = ref
         self._mailbox: Mailbox | None = None
         self._log = system.actor_logger(self)
-        self._state: ActorState = NewState()
+        self._state: ActorState = State.NEW.value
         if parent_context is not None:
             parent_context.attach_child(self)
         self._stash: list[MessageType] = []
@@ -469,6 +485,11 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
         Actual system message handling.
         """
         with self.l:
+            match message:
+                case ActorSystem.Failed(actor_ref, exception):
+                    print(
+                        f"Actor {self._ref.path} received failure from {actor_ref.path}: {exception}"
+                    )
             self._behavior.on_signal(self, message)
 
     def on_message(self, message: MessageType) -> None:
@@ -488,6 +509,7 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
                         self._behavior = new_behavior
             except Exception as e:
                 if self._parent is not None:
+                    print(f"parent {self._parent.path}")
                     self._parent.tell_system(ActorSystem.Failed(self._ref, e))
                     self._behavior = Behaviors.failed
 

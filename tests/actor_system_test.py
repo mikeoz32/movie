@@ -100,6 +100,7 @@ def test_actor_failed():
         def receive(
             self, context: ActorContext[str], message: str
         ) -> "AbstractBehavior[str] | None":
+            context.log.info(f"Child received message: {message}")
             raise Exception("Simulated failure in Child actor")
 
     class TestBehavior(AbstractBehavior[str]):
@@ -123,7 +124,9 @@ def test_actor_failed():
     system = ActorSystem.create(TestBehavior.create(), "test-system")
     assert system is not None
     system.tell("Hello, Actor!")
-    # time.sleep(0.1) # TODO: fix error handling in actor system, this line make test stuck
+    time.sleep(
+        0.5
+    )  # TODO: fix error handling in actor system, this line make test stuck
     system.stop()
 
 

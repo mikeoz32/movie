@@ -51,19 +51,19 @@ class DefaultMailbox(Mailbox):
     def __call__(self) -> None:
         while True:
             try:
+                system_message = self._system_messages.get(block=False)
+                self._actor.invoke_system(system_message)
+                self._system_messages.task_done()
+            except Empty:
+                break
+        while True:
+            try:
                 message = self._messages.get(block=False)
                 self._actor.invoke(message)
                 self._messages.task_done()
             except Empty:
                 break
 
-        while True:
-            try:
-                system_message = self._system_messages.get(block=False)
-                self._actor.invoke_system(system_message)
-                self._system_messages.task_done()
-            except Empty:
-                break
         self._scheduled = False
 
 
