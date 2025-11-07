@@ -1,7 +1,7 @@
 from concurrent.futures import Future
 import os
 from queue import Empty, Queue, ShutDown
-from threading import Thread
+from threading import Thread, Lock
 from typing import Protocol, Tuple
 from movie.dispatch.dispatcher import InternalDispatcher, Task
 
@@ -42,39 +42,29 @@ class Worker:
         self._running = False
         self._thread.join()
 
-    def run(
-        self,
-    ) -> None:
+    def run(self) -> None:
         while self._running is True:
-            task = None
-            queue = None
             try:
-                task = self._queue.get(timeout=0.01)
-                queue = self._queue
-            except Empty:
-                try:
-                    task = self._dispatcher.get_task()
-                    queue = self._dispatcher.queue
-                except Empty:
-                    continue
+                task = self._queue.get()
             except ShutDown:
                 break
-            if task is not None:
-                (f, t) = task
-                try:
-                    result = t()
-                    f.set_result(result)
-                except Exception as e:
-                    f.set_exception(e)
-                del task
-                queue.task_done()
+            (f, t) = task
+            try:
+                result = t()
+                f.set_result(result)
+            except Exception as e:
+                f.set_exception(e)
+            del task
+            self._queue.task_done()
 
 
 class WorkerPoolDispatcherImpl(WorkerPoolDispatcher):
     def __init__(self) -> None:
         self._cpu_count = os.cpu_count() or 1
-        self._workers: list[Worker | None] = [None] * self._cpu_count
+        self._workers: list[Worker | None] = [None] * (self._cpu_count * 4)
         self._queue: Queue[Task] = Queue()
+        self._rr_lock: Lock = Lock()
+        self._rr_index: int = 0
 
         for i in range(self._cpu_count):
             worker = Worker(self)
@@ -107,17 +97,16 @@ class WorkerPoolDispatcherImpl(WorkerPoolDispatcher):
         return self._queue
 
     def _min_loaded_worker(self) -> Worker:
-        min_load = float("inf")
-        selected_worker: Worker | None = None
-
-        for worker in self._workers:
-            if worker is not None:
-                load = worker.load()
-                if load < min_load:
-                    min_load = load
-                    selected_worker = worker
-
-        if selected_worker is None:
+        # Backward-compatible name; now uses round-robin selection
+        n = len(self._workers)
+        if n == 0:
             raise RuntimeError("No available workers")
-
-        return selected_worker
+        with self._rr_lock:
+            start = self._rr_index
+            for i in range(n):
+                idx = (start + i) % n
+                worker = self._workers[idx]
+                if worker is not None:
+                    self._rr_index = (idx + 1) % n
+                    return worker
+        raise RuntimeError("No available workers")

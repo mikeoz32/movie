@@ -43,7 +43,7 @@ class DefaultMailbox(Mailbox):
             except Empty:
                 break
             except Exception:
-                self._system_messages.task_done()
+                self._messages.task_done()
                 raise
 
         while True:

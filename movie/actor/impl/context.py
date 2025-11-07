@@ -349,7 +349,7 @@ class FailedState(ActorState):
     def send_system(
         self, context: "LocalActorContext", message: ActorSystem.SystemMessage
     ) -> None:
-        pass
+        context.tell_system(message)
 
     def invoke(self, context: "LocalActorContext", message: MessageType) -> None:
         pass
@@ -357,11 +357,19 @@ class FailedState(ActorState):
     def invoke_system(
         self, context: "LocalActorContext", message: ActorSystem.SystemMessage
     ) -> "ActorState":
-        return self
+        match message:
+            case ActorSystem.PreStart():
+                # Already started, ignore
+                return self
+            case ActorSystem.Stop():
+                # Initiate graceful shutdown
+                return StoppingState()
+            case _:
+                context.tell_system(message)
+                return self
 
 
 class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
-
     def __init__(
         self,
         behavior: AbstractBehavior[MessageType],
@@ -412,9 +420,6 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
     @state.setter
     def state(self, new_state: ActorState) -> None:
         if self._state is not new_state:
-            # self.log.info(
-            #     f"Transitioning from {type(self._state).__name__} to {type(new_state).__name__}"
-            # )
             self._state = new_state
             self._state.enter(self)
 

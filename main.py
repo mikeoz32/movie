@@ -174,6 +174,8 @@ class IotSupervisor(AbstractBehavior[None]):
             case ResponseDeviceRegistered(device):
                 context.log.info(f"Device registered: {device}")
                 device.tell(RecordTemperature(context.get_self(), 1, 23.5))
+            case ResponseWriteTemperature(request_id):
+                context.log.info(f"Temperature recorded with request id {request_id}")
 
     @staticmethod
     def create() -> AbstractBehavior[None]:
@@ -182,7 +184,7 @@ class IotSupervisor(AbstractBehavior[None]):
 
 def main():
     system = ActorSystem.create(IotSupervisor.create(), "iot-supervisor")
-    time.sleep(2)
+    time.sleep(0.1)
     system.stop()
 
 

@@ -1,6 +1,6 @@
 import enum
 import os
-from threading import Thread
+from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor as ThreadPool
 from queue import Empty, Queue, ShutDown
 from typing import Callable, Protocol
@@ -122,6 +122,8 @@ class Scheduler:
         self._cpu_count = os.cpu_count() or 1
         self._workers: list[Worker | None] = [None] * self._cpu_count
         self._queue: Queue[Task] = Queue()
+        self._rr_lock: Lock = Lock()
+        self._rr_index: int = 0
 
         for i in range(self._cpu_count):
             worker = Worker(self)
@@ -141,7 +143,7 @@ class Scheduler:
 
     def schedule(self, task: Task) -> None:
         try:
-            worker = self._min_loaded_worker()
+            worker = self._next_worker()
             worker.submit(task)
         except RuntimeError:
             self._queue.put(task)
@@ -150,20 +152,22 @@ class Scheduler:
         return self._queue.get(block=False)
 
     def _min_loaded_worker(self) -> "Worker":
-        min_load = float("inf")
-        selected_worker: "Worker | None" = None
+        # Backward-compatible name; now uses round-robin selection
+        return self._next_worker()
 
-        for worker in self._workers:
-            if worker is not None:
-                load = worker.load()
-                if load < min_load:
-                    min_load = load
-                    selected_worker = worker
-
-        if selected_worker is None:
+    def _next_worker(self) -> "Worker":
+        n = len(self._workers)
+        if n == 0:
             raise RuntimeError("No available workers")
-
-        return selected_worker
+        with self._rr_lock:
+            start = self._rr_index
+            for i in range(n):
+                idx = (start + i) % n
+                worker = self._workers[idx]
+                if worker is not None:
+                    self._rr_index = (idx + 1) % n
+                    return worker
+        raise RuntimeError("No available workers")
 
 
 class ThreadPoolScheduler(Scheduler):
@@ -211,24 +215,12 @@ class Worker:
         self._running = False
         self._thread.join()
 
-    def run(
-        self,
-    ) -> None:
+    def run(self) -> None:
         while self._running is True:
-            task = None
-            queue = None
             try:
-                task = self._queue.get(timeout=0.01)
-                queue = self._queue
-            except Empty:
-                try:
-                    task = self._scheduler.get_task()
-                    queue = self._scheduler._queue
-                except Empty:
-                    continue
+                task = self._queue.get()
             except ShutDown:
                 break
-            if task is not None:
-                task()
-                del task
-                queue.task_done()
+            task()
+            del task
+            self._queue.task_done()

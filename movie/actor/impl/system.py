@@ -5,7 +5,7 @@ import time
 from typing import Any, Callable, Dict, Generic, Protocol, Type, TypeVar, cast
 import uuid
 from movie.actor import ActorSystem
-from movie.actor.behaviour import AbstractBehavior
+from movie.actor.behaviour import AbstractBehavior, Behaviors
 from movie.actor.context import ActorContext
 from movie.actor.impl.context import LocalActorContext, StoppedState
 from movie.actor.impl.ref import LocalActorRef
@@ -59,13 +59,61 @@ class ExtensionRegisrty:
         return cast(E, ext)
 
 
+class RootGuardianBehavior(AbstractBehavior[Any]):
+    def __init__(self, context: ActorContext[Any]) -> None:
+        super().__init__(context)
+
+    @staticmethod
+    def create() -> "AbstractBehavior[Any]":
+        return Behaviors.setup(lambda ctx: RootGuardianBehavior(ctx))
+
+    def receive(self, context: ActorContext, message: Any) -> AbstractBehavior | None:
+        return self
+
+
 class ActorRegistry:
-    def __init__(self) -> None:
+    def __init__(self, system: "ActorSystemImpl") -> None:
         self._root_guardian: ActorRef | None = None
         self._user_guardian: ActorRef | None = None
         self._system_guardian: ActorRef | None = None
+        self._actors: Dict[uuid.UUID, "LocalActorContext"] = {}
+        self._system = system
 
-    def start(self, system: "ActorSystemImpl") -> None: ...
+    def create_root_guardian(self) -> ActorRef:
+        ref = LocalActorRef(self._system, RootActorPath(Address("movie", "/")))
+        context = LocalActorContext(
+            RootGuardianBehavior.create(), ref, self._system, None
+        )
+
+        self._root_guardian = ref
+        self._actors[ref.id] = context
+        context.start()
+        return ref
+
+    def start(self) -> None:
+        self._root_guardian = self.create_root_guardian()
+
+    def spawn(
+        self,
+        behavior: AbstractBehavior[Any],
+        name: str,
+        *,
+        parent: "ActorContext | None" = None,
+    ) -> "ActorRef":
+        with ActorSystemImpl.l:
+            parent = parent or cast(
+                LocalActorContext, self._actors[self._root_guardian.id]
+            )
+            ref = LocalActorRef(
+                self._system,
+                parent.get_self().path.child(name),
+            )
+            context = LocalActorContext(
+                behavior, ref, self._system, cast(LocalActorContext, parent)
+            )
+            self._actors[ref.id] = context
+            context.start()
+            return ref
 
 
 class ActorSystemImpl(InternalActorSystem[MessageType]):
@@ -93,6 +141,7 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         self._root_behavior = root_behavior
         self._root_ref: ActorRef | None
         self._name = name
+        self._actor_registry = ActorRegistry(self)
 
         self._actors: Dict[uuid.UUID, "LocalActorContext"] = {}
 
@@ -128,12 +177,13 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         root.addHandler(handlers.QueueHandler(self._log_queue))
 
     def start(self) -> None:
+        self._actor_registry.start()
         self._root_ref = self.spawn(self._root_behavior, self._name)
 
     def stop(self) -> None:
-        self._root_ref.tell_system(ActorSystem.Stop())
+        self._actor_registry._root_guardian.tell_system(ActorSystem.Stop())
         while True:
-            match self.get_context(self._root_ref).state:
+            match self.get_context(self._actor_registry._root_guardian).state:
                 case StoppedState():
                     break
             time.sleep(0.1)
@@ -149,21 +199,22 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         *,
         parent: "ActorContext | None" = None,
     ) -> "ActorRef":
-        with ActorSystemImpl.l:
-            ref = LocalActorRef(
-                self,
-                (
-                    RootActorPath(Address("movie", self._name))
-                    if not parent
-                    else parent.get_self().path.child(name)
-                ),
-            )
-            context = LocalActorContext(
-                behavior, ref, self, cast(LocalActorContext, parent)
-            )
-            self._actors[ref.id] = context
-            context.start()
-            return ref
+        # with ActorSystemImpl.l:
+        #     ref = LocalActorRef(
+        #         self,
+        #         (
+        #             RootActorPath(Address("movie", self._name))
+        #             if not parent
+        #             else parent.get_self().path.child(name)
+        #         ),
+        #     )
+        #     context = LocalActorContext(
+        #         behavior, ref, self, cast(LocalActorContext, parent)
+        #     )
+        #     self._actors[ref.id] = context
+        #     context.start()
+        #     return ref
+        return self._actor_registry.spawn(behavior, name, parent=parent)
 
     @property
     def mailboxes(self) -> MailboxManager:
@@ -171,7 +222,7 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
 
     def get_context(self, ref: ActorRef) -> "LocalActorContext | None":
         with ActorSystemImpl.l:
-            return self._actors.get(ref.id, None)
+            return self._actor_registry._actors.get(ref.id, None)
 
     def unregister_actor(self, ref: ActorRef) -> None:
         with ActorSystemImpl.l:

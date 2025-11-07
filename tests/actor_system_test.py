@@ -42,7 +42,6 @@ def test_actor_system_creation():
 def test_actor_system_load():
     class Child(AbstractBehavior[str]):
         receive_count = 0
-        l = RLock()
 
         def __init__(self, context: ActorContext[str]) -> None:
             super().__init__(context)
@@ -54,8 +53,7 @@ def test_actor_system_load():
         def receive(
             self, context: ActorContext, message: str
         ) -> "AbstractBehavior | None":
-            with Child.l:
-                Child.receive_count += 1
+            Child.receive_count += 1
 
     class TestBehavior(AbstractBehavior[str]):
         def __init__(self, context: ActorContext[str]) -> None:
@@ -125,6 +123,7 @@ def test_actor_failed():
     system = ActorSystem.create(TestBehavior.create(), "test-system")
     assert system is not None
     system.tell("Hello, Actor!")
+    # time.sleep(0.1) # TODO: fix error handling in actor system, this line make test stuck
     system.stop()
 
 
