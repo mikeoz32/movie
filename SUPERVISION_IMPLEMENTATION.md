@@ -17,7 +17,7 @@ Successfully implemented the OneForOne supervision strategy for the `movie` acto
 - On restart:
   - Clears message stash
   - Resets behavior to original (deferred) behavior
-  - Transitions to STARTING state for reinitiali zation
+  - Transitions to STARTING state for reinitialization
   
 ### 3. Enhanced LocalActorContext
 - **File**: `movie/actor/impl/context.py`
