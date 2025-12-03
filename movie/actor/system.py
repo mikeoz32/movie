@@ -35,6 +35,13 @@ class ActorSystem(ActorRef[MessageType], Protocol):
     class Terminate: ...
 
     @dataclass(frozen=True)
+    class Restart:
+        """
+        System message indicating that the actor should restart.
+        Sent from supervisor to failed actor.
+        """
+
+    @dataclass(frozen=True)
     class Terminated:
         """
         System message indicating that an actor has terminated.
@@ -53,7 +60,7 @@ class ActorSystem(ActorRef[MessageType], Protocol):
         ref: ActorRef
         exception: Exception
 
-    SystemMessage = Union[PreStart, PostStop, Terminated, Failed, Stop, Terminate]
+    SystemMessage = Union[PreStart, PostStop, Terminated, Failed, Stop, Terminate, Restart]
 
     _impl: "type[ActorSystem] | None" = None
 

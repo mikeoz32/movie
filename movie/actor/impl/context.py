@@ -204,11 +204,11 @@ class RunningState(ActorState):
         """
         try:
             context.on_message(message)
-            return self
         except Exception as e:
             if context._parent is not None:
                 context._parent.tell_system(ActorSystem.Failed(context._ref, e))
-                return State.FAILED.value
+                # Transition to FAILED state
+                context.state = State.FAILED.value
 
     def invoke_system(
         self, context: "LocalActorContext", message: ActorSystem.SystemMessage
@@ -223,6 +223,10 @@ class RunningState(ActorState):
             case ActorSystem.Stop():
                 # Initiate graceful shutdown
                 return State.STOPPING.value
+            case ActorSystem.Restart():
+                # If we receive Restart in RUNNING state, transition to RESTARTING
+                # This can happen if the failure was detected but state hasn't transitioned yet
+                return State.RESTARTING.value
         context.on_signal(message)
         return self
 
@@ -371,8 +375,64 @@ class FailedState(ActorState):
             case ActorSystem.Stop():
                 # Initiate graceful shutdown
                 return State.STOPPING.value
+            case ActorSystem.Restart():
+                # Supervisor decided to restart
+                return State.RESTARTING.value
             case _:
-                context.tell_system(message)
+                return self
+
+
+class RestartingState(ActorState):
+    """
+    Actor is restarting after a failure.
+
+    When:
+    - Supervisor decided to restart the failed actor.
+    What is Allowed:
+    - Clear actor state.
+    - Reinitialize behavior.
+    Transitions To:
+    - StartingState
+    """
+
+    def enter(self, context: "LocalActorContext") -> None:
+        context.log.info("Actor restarting...")
+        # Clear the stash
+        context._stash.clear()
+        # Reset behavior to the original deferred behavior for reinitialization
+        context._behavior = context._original_behavior
+        # Transition to STARTING which will reinitialize the behavior
+        context.state = State.STARTING.value
+        
+    def start(self, context: "LocalActorContext") -> "ActorState":
+        return State.STARTING.value
+
+    def stop(self, context: "LocalActorContext") -> "ActorState":
+        return State.STOPPING.value
+
+    def send(self, context: "LocalActorContext", message: MessageType) -> None:
+        # Stash messages during restart
+        context.stash(message)
+
+    def send_system(
+        self, context: "LocalActorContext", message: ActorSystem.SystemMessage
+    ) -> None:
+        context.tell_system(message)
+
+    def invoke(self, context: "LocalActorContext", message: MessageType) -> None:
+        # Stash messages during restart
+        context.stash(message)
+
+    def invoke_system(
+        self, context: "LocalActorContext", message: ActorSystem.SystemMessage
+    ) -> "ActorState":
+        match message:
+            case ActorSystem.PreStart():
+                # Transition to starting state
+                return State.STARTING.value
+            case ActorSystem.Stop():
+                return State.STOPPING.value
+            case _:
                 return self
 
 
@@ -383,6 +443,7 @@ class State(enum.Enum):
     STOPPING = StoppingState()
     STOPPED = StoppedState()
     FAILED = FailedState()
+    RESTARTING = RestartingState()
 
 
 class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
@@ -397,6 +458,7 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
 
         self.l = RLock()
         self._behavior = behavior
+        self._original_behavior = behavior  # Store original behavior for restarts
         self._system = system
         self._ref = ref
         self._mailbox: Mailbox | None = None
@@ -487,9 +549,12 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
         with self.l:
             match message:
                 case ActorSystem.Failed(actor_ref, exception):
-                    print(
-                        f"Actor {self._ref.path} received failure from {actor_ref.path}: {exception}"
+                    # OneForOne supervision strategy: restart only the failed child
+                    self.log.error(
+                        f"Child {actor_ref.path} failed with exception: {exception}. Restarting..."
                     )
+                    # Send restart message to the failed child
+                    actor_ref.tell_system(ActorSystem.Restart())
             self._behavior.on_signal(self, message)
 
     def on_message(self, message: MessageType) -> None:
@@ -528,7 +593,6 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
         Delegate to state machine.
         """
         self.state = self.state.invoke_system(self, message)
-        # self.on_signal(message)
 
     def spawn(self, behavior: AbstractBehavior, name: str) -> ActorRef:
         """
