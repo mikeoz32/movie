@@ -390,7 +390,7 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
         self,
         behavior: AbstractBehavior[MessageType],
         ref: LocalActorRef[MessageType],
-        system: ActorSystemImpl,
+        system: "ActorSystemImpl",
         parent_context: "LocalActorContext | None" = None,
     ) -> None:
         ChildrenMixin.__init__(self)

@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 class LocalActorRef(ActorRef[MessageType]):
-    def __init__(self, system: ActorSystemImpl, path: ActorPath) -> None:
+    def __init__(self, system: "ActorSystemImpl", path: ActorPath) -> None:
         self._lock = RLock()
         self._system = system
         self._path = path
@@ -24,7 +24,7 @@ class LocalActorRef(ActorRef[MessageType]):
             if context is not None:
                 context.send(message)
 
-    def tell_system(self, message: ActorSystem.SystemMessage) -> None:
+    def tell_system(self, message: "ActorSystem.SystemMessage") -> None:
         with self._lock:
             context = self._system.get_context(self)
             if context is not None:

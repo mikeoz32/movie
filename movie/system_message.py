@@ -21,7 +21,7 @@ class Terminated:
     Is sent to watchers of the terminated actor.
     """
 
-    ref: ActorRef
+    ref: "ActorRef"
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class Failed:
     Is sent to supervisors of the failed actor.
     """
 
-    ref: ActorRef
+    ref: "ActorRef"
     exception: Exception
 
 

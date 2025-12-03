@@ -2,10 +2,19 @@ import enum
 import os
 from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor as ThreadPool
-from queue import Empty, Queue, ShutDown
+from queue import Empty, Queue
+import sys
 from typing import Callable, Protocol
 
 from typing import TYPE_CHECKING
+
+# ShutDown is only available in Python 3.13+
+if sys.version_info >= (3, 13):
+    from queue import ShutDown
+else:
+    # For Python < 3.13, define a placeholder exception
+    class ShutDown(Exception):
+        pass
 
 # For preventing circular imports
 if TYPE_CHECKING:
@@ -23,7 +32,7 @@ class DefaultMailbox(Mailbox):
     An actor mailbox. Handles user and system messages and processes them.
     """
 
-    def __init__(self, scheduler: "Scheduler", actor: ActorContext) -> None:
+    def __init__(self, scheduler: "Scheduler", actor: "ActorContext") -> None:
         self._scheduler = scheduler
         self._messages: Queue = Queue()
         self._system_messages: Queue = Queue()
@@ -45,8 +54,10 @@ class DefaultMailbox(Mailbox):
     def stop(self) -> None:
         self._messages.join()
         self._system_messages.join()
-        self._messages.shutdown()
-        self._system_messages.shutdown()
+        # shutdown() method is only available in Python 3.13+
+        if hasattr(self._messages, 'shutdown'):
+            self._messages.shutdown()
+            self._system_messages.shutdown()
 
     def __call__(self) -> None:
         while True:
@@ -99,7 +110,7 @@ class MailboxType(enum.Enum):
 
 def create_mailbox(
     scheduler: "Scheduler",
-    actor: ActorContext,
+    actor: "ActorContext",
     mailbox_type: MailboxType = MailboxType.DEFAULT,
 ) -> Mailbox:
     return mailbox_type.value(scheduler, actor)
@@ -139,7 +150,9 @@ class Scheduler:
             if worker is not None:
                 worker.stop()
         self._queue.join()
-        self._queue.shutdown(True)
+        # shutdown() method is only available in Python 3.13+
+        if hasattr(self._queue, 'shutdown'):
+            self._queue.shutdown(True)
 
     def schedule(self, task: Task) -> None:
         try:
@@ -211,7 +224,9 @@ class Worker:
 
     def stop(self) -> None:
         self._queue.join()
-        self._queue.shutdown()
+        # shutdown() method is only available in Python 3.13+
+        if hasattr(self._queue, 'shutdown'):
+            self._queue.shutdown()
         self._running = False
         self._thread.join()
 

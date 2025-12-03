@@ -43,7 +43,7 @@ class AbstractBehavior(Generic[MessageType]):
     ) -> "AbstractBehavior | None": ...
 
     def on_signal(
-        self, context: ActorContext, message: ActorSystem.SystemMessage
+        self, context: ActorContext, message: "ActorSystem.SystemMessage"
     ) -> None: ...
 
 

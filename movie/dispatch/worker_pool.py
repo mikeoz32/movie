@@ -1,9 +1,18 @@
 from concurrent.futures import Future
 import os
-from queue import Empty, Queue, ShutDown
+from queue import Empty, Queue
+import sys
 from threading import Thread, Lock
 from typing import Protocol, Tuple
 from movie.dispatch.dispatcher import InternalDispatcher, Task
+
+# ShutDown is only available in Python 3.13+
+if sys.version_info >= (3, 13):
+    from queue import ShutDown
+else:
+    # For Python < 3.13, define a placeholder exception
+    class ShutDown(Exception):
+        pass
 
 
 class WorkerPoolDispatcher(InternalDispatcher, Protocol):
@@ -38,7 +47,9 @@ class Worker:
 
     def stop(self) -> None:
         self._queue.join()
-        self._queue.shutdown()
+        # shutdown() method is only available in Python 3.13+
+        if hasattr(self._queue, 'shutdown'):
+            self._queue.shutdown()
         self._running = False
         self._thread.join()
 
