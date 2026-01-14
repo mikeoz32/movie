@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import enum
-from typing import Callable, Generic
+from typing import TYPE_CHECKING, Callable, Generic
 
 from movie.actor.context import ActorContext
 from movie.actor.message import MessageType
-from typing import TYPE_CHECKING
+from movie.actor.supervision import SupervisorDirective
 if TYPE_CHECKING:
     from movie.actor.system import ActorSystem
 
@@ -45,6 +47,14 @@ class AbstractBehavior(Generic[MessageType]):
     def on_signal(
         self, context: ActorContext, message: ActorSystem.SystemMessage
     ) -> None: ...
+
+    def supervise(
+        self,
+        context: ActorContext,
+        child: "ActorRef",
+        exception: Exception,
+    ) -> SupervisorDirective:
+        return SupervisorDirective.RESTART
 
 
 class DefferedBehavior(AbstractBehavior):

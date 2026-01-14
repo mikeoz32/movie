@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from threading import RLock
 from typing import TYPE_CHECKING
 import uuid

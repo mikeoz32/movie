@@ -7,7 +7,7 @@ import uuid
 from movie.actor import ActorSystem
 from movie.actor.behaviour import AbstractBehavior, Behaviors
 from movie.actor.context import ActorContext
-from movie.actor.impl.context import LocalActorContext, StoppedState
+from movie.actor.impl.context import LocalActorContext
 from movie.actor.impl.ref import LocalActorRef
 from movie.actor.logger import ActorLogger
 from movie.actor.message import MessageType
@@ -183,9 +183,9 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
     def stop(self) -> None:
         self._actor_registry._root_guardian.tell_system(ActorSystem.Stop())
         while True:
-            match self.get_context(self._actor_registry._root_guardian).state:
-                case StoppedState():
-                    break
+            context = self.get_context(self._actor_registry._root_guardian)
+            if context is not None and context.is_stopped:
+                break
             time.sleep(0.1)
 
         self._dispatchers.stop_all()

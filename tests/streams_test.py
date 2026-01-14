@@ -66,3 +66,55 @@ def test_linear_source(actor_system: ActorSystem):
     g.run(actor_system)
 
     collector.wait_count(N, timeout=1)
+
+
+def test_collect_materialized(actor_system: ActorSystem):
+    sink, result_future = Sink.collect()
+    g = Source.from_iterable(range(5)).via(Flow.map(lambda x: x * 3)).to(sink)
+
+    run_result = g.run(actor_system)
+    assert run_result.materialized is result_future
+
+    result = result_future.result(timeout=1)
+    assert result == [0, 3, 6, 9, 12]
+
+
+def test_for_each_materialized(actor_system: ActorSystem):
+    seen: list[int] = []
+
+    sink, result_future = Sink.for_each_materialized(lambda x: seen.append(x))
+    g = Source.from_iterable(range(4)).to(sink)
+
+    run_result = g.run(actor_system)
+    assert run_result.materialized is result_future
+
+    result = result_future.result(timeout=1)
+    assert result is None
+    assert seen == [0, 1, 2, 3]
+
+
+def test_collect_materialized_error(actor_system: ActorSystem):
+    def boom(x: int) -> int:
+        if x == 2:
+            raise ValueError("boom")
+        return x
+
+    sink, result_future = Sink.collect()
+    g = Source.from_iterable(range(4)).via(Flow.map(boom)).to(sink)
+    g.run(actor_system)
+
+    with pytest.raises(ValueError, match="boom"):
+        result_future.result(timeout=1)
+
+
+def test_for_each_materialized_error(actor_system: ActorSystem):
+    def boom(x: int) -> None:
+        if x == 1:
+            raise RuntimeError("kaput")
+
+    sink, result_future = Sink.for_each_materialized(boom)
+    g = Source.from_iterable(range(3)).to(sink)
+    g.run(actor_system)
+
+    with pytest.raises(RuntimeError, match="kaput"):
+        result_future.result(timeout=1)
