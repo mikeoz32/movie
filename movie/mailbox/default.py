@@ -1,4 +1,5 @@
 from queue import Empty, Queue
+from threading import RLock
 from movie.actor.context import ActorContext
 from movie.dispatch.dispatcher import Dispatcher
 from movie.mailbox.mailbox import Mailbox
@@ -15,18 +16,24 @@ class DefaultMailbox(Mailbox):
         self._system_messages: Queue = Queue()
         self._actor = actor
         self._scheduled = False
+        self._lock = RLock()
+
+    def _schedule_if_needed(self) -> None:
+        should_dispatch = False
+        with self._lock:
+            if not self._scheduled:
+                self._scheduled = True
+                should_dispatch = True
+        if should_dispatch:
+            self._dispatcher.dispatch(self)
 
     def send(self, message) -> None:
         self._messages.put(message)
-        if not self._scheduled:
-            self._dispatcher.dispatch(self)
-        self._scheduled = True
+        self._schedule_if_needed()
 
     def sendSystem(self, message) -> None:
         self._system_messages.put(message)
-        if not self._scheduled:
-            self._dispatcher.dispatch(self)
-        self._scheduled = True
+        self._schedule_if_needed()
 
     def stop(self) -> None:
         self._messages.join()
@@ -56,7 +63,12 @@ class DefaultMailbox(Mailbox):
             except Exception:
                 self._system_messages.task_done()
                 raise
-        if self._messages.qsize() > 0 or self._system_messages.qsize() > 0:
+        should_redispatch = False
+        with self._lock:
+            if self._messages.empty() and self._system_messages.empty():
+                self._scheduled = False
+            else:
+                should_redispatch = True
+
+        if should_redispatch:
             self._dispatcher.dispatch(self)
-        else:
-            self._scheduled = False

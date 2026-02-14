@@ -12,7 +12,7 @@ default_config = Config(
 
 class MailboxManager:
     def __init__(self, config: Config) -> None:
-        self._config = config.get_config("movie.malebox") or Config({}).with_fallback(
+        self._config = config.get_config("movie.mailbox") or Config({}).with_fallback(
             default_config
         )
 

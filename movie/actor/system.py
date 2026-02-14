@@ -1,9 +1,10 @@
 # Public API
 from dataclasses import dataclass
-from typing import Any, Protocol, Union
+from typing import Any, Callable, Protocol, Type, TypeVar, Union
 
 from movie.actor.behaviour import AbstractBehavior
 from movie.actor.context import ActorContext
+from movie.actor.extension import E, Extension, ExtensionId
 from movie.actor.message import MessageType
 from movie.actor.ref import ActorRef, InternalActorRef
 from movie.config import Config
@@ -34,6 +35,8 @@ class ActorSystem(ActorRef[MessageType], Protocol):
 
     class Terminate: ...
 
+    class Restart: ...
+
     @dataclass(frozen=True)
     class Terminated:
         """
@@ -53,7 +56,15 @@ class ActorSystem(ActorRef[MessageType], Protocol):
         ref: ActorRef
         exception: Exception
 
-    SystemMessage = Union[PreStart, PostStop, Terminated, Failed, Stop, Terminate]
+    SystemMessage = Union[
+        PreStart,
+        PostStop,
+        Terminated,
+        Failed,
+        Stop,
+        Terminate,
+        Restart,
+    ]
 
     _impl: "type[ActorSystem] | None" = None
 
@@ -93,7 +104,11 @@ class ExtendedActorSystem(ActorSystem[MessageType], Protocol):
     Extended api for extensions
     """
 
-    ...
+    def extension(self, ext_type: Type[E]) -> E: ...
+
+    def register_extension(
+        self, ext_id: ExtensionId[E], factory: Callable[["ActorSystem"], E]
+    ) -> E: ...
 
 
 # Internal API

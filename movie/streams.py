@@ -1,5 +1,6 @@
-from dataclasses import dataclass
 from collections import deque
+from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import Callable, Generic, Iterable, List, Tuple, TypeVar
 
 from movie.actor import AbstractBehavior, ActorContext, ActorRef, ActorSystem, Behaviors
@@ -68,7 +69,12 @@ class StageBehavior(AbstractBehavior[StageBehaviorCommand]):
         return x
 
     def _maybe_pull(self):
-        if self._up and not self._up_closed and len(self._buf) < (self._maxbuf // 2):
+        if (
+            self._up
+            and self._down is not None
+            and not self._up_closed
+            and len(self._buf) < (self._maxbuf // 2)
+        ):
             self._up.tell(Requiest(self._prefetch))
 
     def _push(self):
@@ -193,17 +199,30 @@ class SinkForEach(StageBehavior, Generic[T]):
         self,
         ctx: ActorContext,
         func: Callable[[T], None],
+        result_future: Future[None] | None = None,
         *,
         prefetch: int = 16,
         maxbuf: int = 256,
     ) -> None:
         super().__init__(ctx, prefetch=prefetch, maxbuf=maxbuf)
         self._func: Callable[[T], None] = func
+        self._result_future = result_future
 
     @staticmethod
-    def create(func: Callable[[T], None], prefetch: int = 16, maxbuf: int = 256):
+    def create(
+        func: Callable[[T], None],
+        result_future: Future[None] | None = None,
+        prefetch: int = 16,
+        maxbuf: int = 256,
+    ):
         return Behaviors.setup(
-            lambda ctx: SinkForEach(ctx, func, prefetch=prefetch, maxbuf=maxbuf)
+            lambda ctx: SinkForEach(
+                ctx,
+                func,
+                result_future,
+                prefetch=prefetch,
+                maxbuf=maxbuf,
+            )
         )
 
     def receive(
@@ -222,13 +241,64 @@ class SinkForEach(StageBehavior, Generic[T]):
                     if self._up is not None:
                         self._up.tell(Requiest(1))
                 except Exception as e:
+                    if self._result_future is not None:
+                        if not self._result_future.done():
+                            self._result_future.set_exception(e)
                     if self._up is not None:
                         self._up.tell(OnEerror(e))
             case OnComplete():
-                pass
+                if self._result_future is not None:
+                    if not self._result_future.done():
+                        self._result_future.set_result(None)
             case OnEerror(error):
+                if self._result_future is not None:
+                    if not self._result_future.done():
+                        self._result_future.set_exception(error)
                 if self._up is not None:
                     self._up.tell(OnEerror(error))
+        return self
+
+
+class SinkCollect(StageBehavior, Generic[T]):
+    def __init__(
+        self,
+        ctx: ActorContext,
+        result_future: Future[List[T]],
+        *,
+        prefetch: int = 16,
+        maxbuf: int = 256,
+    ) -> None:
+        super().__init__(ctx, prefetch=prefetch, maxbuf=maxbuf)
+        self._result_future = result_future
+        self._items: List[T] = []
+
+    @staticmethod
+    def create(
+        result_future: Future[List[T]], prefetch: int = 16, maxbuf: int = 256
+    ):
+        return Behaviors.setup(
+            lambda ctx: SinkCollect(ctx, result_future, prefetch=prefetch, maxbuf=maxbuf)
+        )
+
+    def receive(
+        self, context: ActorContext[StageBehaviorCommand], message: StageBehaviorCommand
+    ) -> AbstractBehavior[StageBehaviorCommand] | None:
+        match message:
+            case SetUpstream(up):
+                self._up = up
+                self._up.tell(Subscribe(context.get_self()))
+                if self._up is not None:
+                    self._up.tell(Requiest(self._prefetch))
+            case OnNext(element):
+                self._items.append(element)
+                if self._up is not None:
+                    self._up.tell(Requiest(1))
+            case OnComplete():
+                if not self._result_future.done():
+                    self._result_future.set_result(self._items)
+            case OnEerror(error):
+                if not self._result_future.done():
+                    self._result_future.set_exception(error)
         return self
 
 
@@ -252,13 +322,46 @@ class Sink(Generic[T]):
         self,
         behavior_factory: Callable[[], AbstractBehavior[StageBehaviorCommand]],
         name: str | None = None,
+        *,
+        materialized_future: Future | None = None,
     ):
         self._name = name or f"Sink-{id(self)}"
         self._behavior_factory = behavior_factory
+        self._materialized_future = materialized_future
 
     @staticmethod
     def for_each(func: Callable[[T], None], name: str | None = None) -> "Sink[T]":
         return Sink(lambda: SinkForEach.create(func), name)
+
+    @staticmethod
+    def for_each_materialized(
+        func: Callable[[T], None], name: str | None = None
+    ) -> tuple["Sink[T]", Future[None]]:
+        result_future: Future[None] = Future()
+        return (
+            Sink(
+                lambda: SinkForEach.create(func, result_future),
+                name,
+                materialized_future=result_future,
+            ),
+            result_future,
+        )
+
+    @staticmethod
+    def collect(name: str | None = None) -> tuple["Sink[T]", Future[List[T]]]:
+        result_future: Future[List[T]] = Future()
+        return (
+            Sink(
+                lambda: SinkCollect.create(result_future),
+                name,
+                materialized_future=result_future,
+            ),
+            result_future,
+        )
+
+    @property
+    def materialized_future(self) -> Future | None:
+        return self._materialized_future
 
 
 class Source(Generic[T]):
@@ -305,6 +408,7 @@ class Chained(Source[T], Generic[T, G]):
 class RunResult:
     stages: List[ActorRef]
     sink: ActorRef
+    materialized: Future | None
 
 
 class RunnableGraph:
@@ -343,4 +447,8 @@ class RunnableGraph:
         if prev_ref is not None:
             sink_ref.tell(SetUpstream(up=prev_ref))
 
-        return RunResult(stages=refs, sink=sink_ref)
+        return RunResult(
+            stages=refs,
+            sink=sink_ref,
+            materialized=self._sink.materialized_future,
+        )

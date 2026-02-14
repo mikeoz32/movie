@@ -1,13 +1,13 @@
 from logging import Formatter, StreamHandler, getLogger, handlers
 import queue
-from threading import RLock
 import time
-from typing import Any, Callable, Dict, Generic, Protocol, Type, TypeVar, cast
+from typing import Any, Callable, Dict, Type, cast
 import uuid
 from movie.actor import ActorSystem
 from movie.actor.behaviour import AbstractBehavior, Behaviors
 from movie.actor.context import ActorContext
-from movie.actor.impl.context import LocalActorContext, StoppedState
+from movie.actor.extension import E, Extension, ExtensionId
+from movie.actor.impl.context import LocalActorContext
 from movie.actor.impl.ref import LocalActorRef
 from movie.actor.logger import ActorLogger
 from movie.actor.message import MessageType
@@ -19,11 +19,6 @@ from movie.dispatch.manager import DispatcherManager
 from movie.mailbox.manager import MailboxManager
 
 
-class Extension(Protocol): ...
-
-
-E = TypeVar("E", bound=Extension)
-
 default_config = Config(
     {
         "movie": {
@@ -31,10 +26,6 @@ default_config = Config(
         }
     }
 )
-
-
-class ExtensionId(Generic[E]): ...
-
 
 class ExtensionRegisrty:
     def __init__(self, system: InternalActorSystem) -> None:
@@ -100,29 +91,24 @@ class ActorRegistry:
         *,
         parent: "ActorContext | None" = None,
     ) -> "ActorRef":
-        with ActorSystemImpl.l:
-            parent = parent or cast(
-                LocalActorContext, self._actors[self._root_guardian.id]
-            )
-            ref = LocalActorRef(
-                self._system,
-                parent.get_self().path.child(name),
-            )
-            context = LocalActorContext(
-                behavior, ref, self._system, cast(LocalActorContext, parent)
-            )
-            self._actors[ref.id] = context
-            context.start()
-            return ref
+        parent = parent or cast(LocalActorContext, self._actors[self._root_guardian.id])
+        ref = LocalActorRef(
+            self._system,
+            parent.get_self().path.child(name),
+        )
+        context = LocalActorContext(
+            behavior, ref, self._system, cast(LocalActorContext, parent)
+        )
+        self._actors[ref.id] = context
+        context.start()
+        return ref
 
 
 class ActorSystemImpl(InternalActorSystem[MessageType]):
-    l = RLock()
 
     def tell(self, message: MessageType) -> None:
-        with ActorSystemImpl.l:
-            if self._root_ref is not None:
-                self._root_ref.tell(message)
+        if self._root_ref is not None:
+            self._root_ref.tell(message)
 
     @property
     def id(self) -> uuid.UUID:
@@ -183,9 +169,9 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
     def stop(self) -> None:
         self._actor_registry._root_guardian.tell_system(ActorSystem.Stop())
         while True:
-            match self.get_context(self._actor_registry._root_guardian).state:
-                case StoppedState():
-                    break
+            context = self.get_context(self._actor_registry._root_guardian)
+            if context is not None and context.is_stopped:
+                break
             time.sleep(0.1)
 
         self._dispatchers.stop_all()
@@ -199,31 +185,22 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         *,
         parent: "ActorContext | None" = None,
     ) -> "ActorRef":
-        # with ActorSystemImpl.l:
-        #     ref = LocalActorRef(
-        #         self,
-        #         (
-        #             RootActorPath(Address("movie", self._name))
-        #             if not parent
-        #             else parent.get_self().path.child(name)
-        #         ),
-        #     )
-        #     context = LocalActorContext(
-        #         behavior, ref, self, cast(LocalActorContext, parent)
-        #     )
-        #     self._actors[ref.id] = context
-        #     context.start()
-        #     return ref
         return self._actor_registry.spawn(behavior, name, parent=parent)
 
     @property
     def mailboxes(self) -> MailboxManager:
         return self._mailboxes
 
+    def extension(self, ext_type: Type[E]) -> E:
+        return self._extensions.get(ext_type)
+
+    def register_extension(
+        self, ext_id: ExtensionId[E], factory: Callable[["ActorSystem"], E]
+    ) -> E:
+        return self._extensions.get_or_register(ext_id, factory)
+
     def get_context(self, ref: ActorRef) -> "LocalActorContext | None":
-        with ActorSystemImpl.l:
-            return self._actor_registry._actors.get(ref.id, None)
+        return self._actor_registry._actors.get(ref.id, None)
 
     def unregister_actor(self, ref: ActorRef) -> None:
-        with ActorSystemImpl.l:
-            self._actors.pop(ref.id, None)
+        self._actors.pop(ref.id, None)

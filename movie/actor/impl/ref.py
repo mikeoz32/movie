@@ -1,4 +1,5 @@
-from threading import RLock
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
 import uuid
 
@@ -13,22 +14,19 @@ if TYPE_CHECKING:
 
 class LocalActorRef(ActorRef[MessageType]):
     def __init__(self, system: ActorSystemImpl, path: ActorPath) -> None:
-        self._lock = RLock()
         self._system = system
         self._path = path
         self._id = uuid.uuid4()
 
     def tell(self, message: MessageType) -> None:
-        with self._lock:
-            context = self._system.get_context(self)
-            if context is not None:
-                context.send(message)
+        context = self._system.get_context(self)
+        if context is not None:
+            context.send(message)
 
     def tell_system(self, message: ActorSystem.SystemMessage) -> None:
-        with self._lock:
-            context = self._system.get_context(self)
-            if context is not None:
-                context.send_system(message)
+        context = self._system.get_context(self)
+        if context is not None:
+            context.send_system(message)
 
     @property
     def id(self) -> uuid.UUID:

@@ -1,11 +1,11 @@
+from __future__ import annotations
+
 import enum
 import os
 from threading import Thread, Lock
 from concurrent.futures import ThreadPoolExecutor as ThreadPool
 from queue import Empty, Queue, ShutDown
-from typing import Callable, Protocol
-
-from typing import TYPE_CHECKING
+from typing import Callable, Protocol, TYPE_CHECKING
 
 # For preventing circular imports
 if TYPE_CHECKING:
@@ -72,24 +72,48 @@ class SingleMessageDispatchMailbox(DefaultMailbox):
     An actor mailbox that processes one message at a time and possibly in different threads.
     """
 
-    def __call__(self) -> None:
-        try:
-            message = self._messages.get(block=False)
-            self._actor.invoke(message)
-            self._messages.task_done()
-            if not self._messages.empty():
-                self._scheduler.schedule(Task(self))
-        except Empty:
-            return
+    def _drain_all(self) -> None:
+        while True:
+            try:
+                system_message = self._system_messages.get(block=False)
+                self._actor.invoke_system(system_message)
+                self._system_messages.task_done()
+            except Empty:
+                break
+        while True:
+            try:
+                message = self._messages.get(block=False)
+                self._actor.invoke(message)
+                self._messages.task_done()
+            except Empty:
+                break
 
+    def __call__(self) -> None:
+        handled = False
         try:
-            message = self._system_messages.get(block=False)
-            self._actor.invoke_system(message)
-            self._messages.task_done()
-            if not self._system_messages.empty():
-                self._scheduler.schedule(Task(self))
+            system_message = self._system_messages.get(block=False)
+            self._actor.invoke_system(system_message)
+            self._system_messages.task_done()
+            handled = True
         except Empty:
-            return
+            pass
+
+        if not handled:
+            try:
+                message = self._messages.get(block=False)
+                self._actor.invoke(message)
+                self._messages.task_done()
+            except Empty:
+                pass
+
+        if not self._messages.empty() or not self._system_messages.empty():
+            if self._scheduler._stopping:
+                self._drain_all()
+                self._scheduled = False
+            else:
+                self._scheduler.schedule(Task(self))
+        else:
+            self._scheduled = False
 
 
 class MailboxType(enum.Enum):
@@ -124,24 +148,33 @@ class Scheduler:
         self._queue: Queue[Task] = Queue()
         self._rr_lock: Lock = Lock()
         self._rr_index: int = 0
+        self._running = False
+        self._stopping = False
 
         for i in range(self._cpu_count):
             worker = Worker(self)
             self._workers[i] = worker
 
     def start(self) -> None:
+        self._running = True
+        self._stopping = False
         for worker in self._workers:
             if worker is not None:
                 worker.start()
 
     def stop(self) -> None:
+        self._stopping = True
         for worker in self._workers:
             if worker is not None:
                 worker.stop()
         self._queue.join()
         self._queue.shutdown(True)
+        self._running = False
+        self._stopping = False
 
     def schedule(self, task: Task) -> None:
+        if not self._running and not self._stopping:
+            return
         try:
             worker = self._next_worker()
             worker.submit(task)
@@ -174,18 +207,26 @@ class ThreadPoolScheduler(Scheduler):
     def __init__(self) -> None:
         self._cpu_count = os.cpu_count() or 1
         self._pool = ThreadPool()
+        self._running = False
+        self._stopping = False
 
     def schedule(self, task: Task) -> None:
+        if not self._running:
+            return
         try:
             self._pool.submit(task)
         except RuntimeError:
             pass
 
     def start(self) -> None:
-        pass
+        self._running = True
+        self._stopping = False
 
     def stop(self) -> None:
+        self._stopping = True
         self._pool.shutdown(wait=True)
+        self._running = False
+        self._stopping = False
 
 
 class Worker:
@@ -200,7 +241,10 @@ class Worker:
         self._scheduler = scheduler
 
     def submit(self, task: Task) -> None:
-        self._queue.put(task)
+        try:
+            self._queue.put(task)
+        except ShutDown:
+            return
 
     def load(self) -> int:
         return self._queue.qsize()
