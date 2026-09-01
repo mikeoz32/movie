@@ -1,5 +1,7 @@
 from __future__ import annotations
-from typing import Any, Generic, Protocol, TYPE_CHECKING
+
+from typing import TYPE_CHECKING, Any, Generic, Protocol
+
 from movie.actor.message import MessageType
 
 if TYPE_CHECKING:
@@ -18,10 +20,6 @@ class ActorContext(Protocol, Generic[MessageType]):
 
     def spawn(self, behavior: AbstractBehavior, name: str) -> ActorRef: ...
 
-    # Invokes behavior with message
-    def invoke(self, message: MessageType) -> None: ...
-    def invoke_system(self, message: ActorSystem.SystemMessage) -> None: ...
-
     @property
     def log(self) -> ActorLogger: ...
 
@@ -29,6 +27,20 @@ class ActorContext(Protocol, Generic[MessageType]):
 # Internal api
 
 
+class ActorBatchFailed(BaseException):
+    def __init__(
+        self, error: BaseException, remaining: list, *, system: bool
+    ) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.remaining = remaining
+        self.system = system
+
+
 class InternalActorContext(ActorContext[MessageType], Protocol):
+    def invoke(self, message: MessageType) -> None: ...
+    def invoke_system(self, message: ActorSystem.SystemMessage) -> None: ...
+    def invoke_batch(self, messages: list, *, system: bool) -> list: ...
+    def can_process_user_messages(self) -> bool: ...
     def attach_child(self, child: "InternalActorContext") -> None: ...
     def set_parent(self, parent: ActorRef[Any]) -> None: ...

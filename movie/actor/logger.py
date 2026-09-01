@@ -18,5 +18,5 @@ class ActorLogger(LoggerAdapter):
     ) -> tuple[Any, MutableMapping[str, Any]]:
         extra = kwargs.setdefault("extra", {})
         extra.setdefault("actor_id", str(self.ctx.get_self().id))
-        extra.setdefault("actor_path", self._path)  # якщо є ім’я
+        extra.setdefault("actor_path", self._path)
         return msg, kwargs

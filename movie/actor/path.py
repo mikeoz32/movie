@@ -1,6 +1,6 @@
+import uuid
 from dataclasses import dataclass
 from typing import Optional, Protocol
-import uuid
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,8 @@ class ActorPath(Protocol):
     def elements(self) -> list[str]: ...
 
     def __repr__(self) -> str:
-        return f"ActorPath(address={self._address}, path={'/'.join(self.elements())}, uid={self._uid})"
+        path = "/".join(self.elements())
+        return f"ActorPath(address={self._address}, path={path}, uid={self._uid})"
 
     def __str__(self) -> str:
         path_str = "/".join(self.elements())

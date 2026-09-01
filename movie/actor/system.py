@@ -1,4 +1,6 @@
 # Public API
+import sys
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Protocol, Union
 
@@ -71,13 +73,30 @@ class ActorSystem(ActorRef[MessageType], Protocol):
 
     def start(self) -> None: ...
 
-    def stop(self) -> None: ...
+    def stop(self, timeout: float | None = None) -> None: ...
 
     @property
     def config(self) -> Config: ...
 
+    @property
+    def actor_count(self) -> int: ...
+
     @staticmethod
-    def create(behavior: AbstractBehavior[MessageType], name: str) -> "ActorSystem":
+    def create(
+        behavior: AbstractBehavior[MessageType],
+        name: str,
+        *,
+        config: Config | None = None,
+    ) -> "ActorSystem":
+        is_gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)
+        if (
+            sys.implementation.name != "cpython"
+            or sys.version_info[:2] != (3, 14)
+            or is_gil_enabled()
+        ):
+            raise RuntimeError(
+                "Movie requires free-threaded CPython 3.14t"
+            )
         if ActorSystem._impl is None:
             default = "movie.actor.impl.system.ActorSystemImpl"
             try:
@@ -85,7 +104,7 @@ class ActorSystem(ActorRef[MessageType], Protocol):
             except ImportError as e:
                 raise NotImplementedError("No ActorSystem implementation available", e)
 
-        system = ActorSystem._impl(behavior, name)
+        system = ActorSystem._impl(behavior, name, config=config)
         system.start()
         return system
 
@@ -96,6 +115,20 @@ class ActorSystem(ActorRef[MessageType], Protocol):
         *,
         parent: ActorContext | None = None,
     ) -> ActorRef[MessageType]: ...
+
+    def terminate(self, ref: ActorRef[Any]) -> None: ...
+
+    def wait_for_actor_start(
+        self, ref: ActorRef[Any], timeout: float | None = None
+    ) -> None: ...
+
+    def actor_start_future(self, ref: ActorRef[Any]) -> Future[None]: ...
+
+    def actor_stop_future(self, ref: ActorRef[Any]) -> Future[None]: ...
+
+    def _submit_completion(self, callback) -> None: ...
+
+    def _submit_callback(self, callback) -> None: ...
 
 
 class ExtendedActorSystem(ActorSystem[MessageType], Protocol):

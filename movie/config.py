@@ -31,7 +31,7 @@ class Config:
         return Config(config_dict)
 
     @staticmethod
-    def from_toml_file(file_path: str) -> "Config":
+    def from_toml_file(file_path: str, *, required: bool = True) -> "Config":
         """Create a Config instance from a TOML file.
 
         Args:
@@ -46,6 +46,8 @@ class Config:
             with open(file_path, "rb") as f:
                 config_dict = tomllib.load(f)
         except FileNotFoundError:
+            if required:
+                raise
             config_dict = {}
         return Config(config_dict)
 
@@ -73,7 +75,7 @@ class Config:
 
         Args:
             path (str): The dot-separated path to the configuration value.
-            default (Any, optional): The default value to return if the path is not found. Defaults to None.
+            default (Any, optional): The default value returned when the path is absent.
 
         Returns:
             Any: The configuration value or the default if not found.
@@ -110,7 +112,7 @@ class Config:
 
         Args:
             path (str): The dot-separated path to the configuration value.
-            default (str | None, optional): The default value to return if the path is not found. Defaults to None.
+            default (str | None, optional): The default value returned when the path is absent.
 
         Returns:
             str | None: The configuration value as a string or the default if not found.
@@ -127,7 +129,7 @@ class Config:
 
         Args:
             path (str): The dot-separated path to the configuration value.
-            default (int | None, optional): The default value to return if the path is not found. Defaults to None.
+            default (int | None, optional): The default value returned when the path is absent.
 
         Returns:
             int | None: The configuration value as an integer or the default if not found.
@@ -152,7 +154,7 @@ class Config:
             cls (Type[T]): The expected class type.
 
         Returns:
-            T | None: The configuration value as an instance of the specified class or None if not found or mismatched.
+            T | None: The configured class, or None when the value is absent or invalid.
         """
         value = self.get(path)
         match value:

@@ -5,14 +5,18 @@ from movie.mailbox.mailbox import Mailbox
 
 default_config = Config(
     {
-        "default": {"type": "movie.mailbox.default.DefaultMailbox"},
+        "default": {
+            "type": "movie.mailbox.default.DefaultMailbox",
+            "capacity": 100_000,
+            "throughput": 100,
+        },
     }
 )
 
 
 class MailboxManager:
     def __init__(self, config: Config) -> None:
-        self._config = config.get_config("movie.malebox") or Config({}).with_fallback(
+        self._config = (config.get_config("movie.mailbox") or Config({})).with_fallback(
             default_config
         )
 
@@ -27,4 +31,10 @@ class MailboxManager:
             raise ValueError(
                 f"Mailbox class for type '{mailbox}' could not be instantiated"
             )
-        return mailbox_class(dispatcher, actor)
+        instance = mailbox_class(dispatcher, actor, mailbox_config)
+        if not all(
+            hasattr(instance, method)
+            for method in ("send", "sendSystem", "stop_user_messages", "close")
+        ):
+            raise TypeError(f"Configured mailbox '{mailbox}' does not implement Mailbox")
+        return instance

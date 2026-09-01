@@ -1,0 +1,19 @@
+[movie.actor]
+log-level = "INFO"
+startup-timeout = 10
+shutdown-timeout = 10
+stash-capacity = 10000
+callback-workers = 4
+max-actors = 100000
+
+[movie.dispatcher.default-dispatcher]
+type = "movie.dispatch.worker_pool.WorkerPoolDispatcherImpl"
+workers = 8
+shutdown-timeout = 10
+queue-capacity = 100000
+system-queue-capacity = 100000
+
+[movie.mailbox.default]
+type = "movie.mailbox.default.DefaultMailbox"
+capacity = 100000
+throughput = 100

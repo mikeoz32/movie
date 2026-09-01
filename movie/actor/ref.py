@@ -1,15 +1,13 @@
 from __future__ import annotations
-from typing import Generic, Protocol
+
 import uuid
+from typing import TYPE_CHECKING, Generic, Protocol
 
 from movie.actor.message import MessageType
 
-from typing import TYPE_CHECKING
-
-
 if TYPE_CHECKING:
-    from movie.actor.path import ActorPath
     from movie.actor import ActorSystem
+    from movie.actor.path import ActorPath
 
 
 class ActorRef(Protocol, Generic[MessageType]):

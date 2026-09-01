@@ -1,7 +1,8 @@
-from dataclasses import dataclass
 import time
+from dataclasses import dataclass
 from typing import Any
-from movie.actor import AbstractBehavior, Behaviors, ActorContext, ActorSystem
+
+from movie.actor import AbstractBehavior, ActorContext, ActorSystem, Behaviors
 from movie.actor.ref import ActorRef
 
 
@@ -143,9 +144,10 @@ class DeviceGroup(AbstractBehavior[DeviceGroupCommand]):
                     reply_to.tell(ResponseDeviceRegistered(self._devices[device_id]))
                 else:
                     context.log.warning(
-                        f"Ignoring TrackDevice request for {group_id}. This actor is responsible for {self._group_id}."
+                        f"Ignoring TrackDevice request for {group_id}. "
+                        f"This actor is responsible for {self._group_id}."
                     )
-            case DeviceTerminated(device_id, group_id, device):
+            case DeviceTerminated(device_id, group_id, _device):
                 context.log.info(
                     f"Device actor for {device_id} in group {group_id} has been terminated"
                 )

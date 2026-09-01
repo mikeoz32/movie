@@ -6,7 +6,9 @@ from typing import TYPE_CHECKING, Callable, Generic
 from movie.actor.context import ActorContext
 from movie.actor.message import MessageType
 from movie.actor.supervision import SupervisorDirective
+
 if TYPE_CHECKING:
+    from movie.actor.ref import ActorRef
     from movie.actor.system import ActorSystem
 
 
@@ -102,7 +104,7 @@ class Behaviors:
                 context: ActorContext,
                 message: MessageType,
             ) -> AbstractBehavior | None:
-                context.log.debug(f"Received message: {message}")
+                context.log.debug("Received message type: %s", type(message).__name__)
                 return receive_fn(context, message)
 
         def setup(ctx: ActorContext) -> AbstractBehavior:

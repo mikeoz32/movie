@@ -1,4 +1,5 @@
 from uuid import uuid4
+
 from movie.actor.path import Address, RootActorPath
 
 
