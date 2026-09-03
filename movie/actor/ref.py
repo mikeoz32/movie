@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING, Generic, Protocol
 
+from movie.actor.identity import ActorIdentity
 from movie.actor.message import MessageType
 
 if TYPE_CHECKING:
@@ -15,6 +16,9 @@ class ActorRef(Protocol, Generic[MessageType]):
 
     @property
     def id(self) -> uuid.UUID: ...
+
+    @property
+    def identity(self) -> ActorIdentity: ...
 
     @property
     def name(self) -> str: ...

@@ -4,11 +4,11 @@ from threading import Lock
 from movie.actor.context import ActorBatchFailed, ActorContext
 from movie.config import Config
 from movie.dispatch.dispatcher import Dispatcher
-from movie.mailbox.mailbox import Mailbox
-
-
-class MailboxCapacityExceeded(RuntimeError):
-    pass
+from movie.mailbox.mailbox import (
+    Mailbox,
+    MailboxAdmissionResult,
+    MailboxCapacityExceeded,
+)
 
 
 class _Entry:
@@ -43,25 +43,40 @@ class DefaultMailbox(Mailbox):
         self._scheduled = False
         self._running = False
         self._inline_run_requested = False
+        self._accepting_user_messages = True
         self._closed = False
 
     def send(self, message) -> None:
-        self._enqueue(self._messages, message, user_message=True)
+        self._enqueue(self._messages, message, user_message=True, report_full=False)
+
+    def try_send(self, message) -> MailboxAdmissionResult:
+        try:
+            return self._enqueue(
+                self._messages, message, user_message=True, report_full=True
+            )
+        except Exception:
+            return MailboxAdmissionResult.FULL
 
     def sendSystem(self, message) -> None:
-        self._enqueue(self._system_messages, message, user_message=False)
+        self._enqueue(
+            self._system_messages, message, user_message=False, report_full=False
+        )
 
-    def _enqueue(self, target: deque, message, *, user_message: bool) -> None:
+    def _enqueue(
+        self, target: deque, message, *, user_message: bool, report_full: bool
+    ) -> MailboxAdmissionResult:
         with self._lock:
-            if self._closed:
-                return
+            if self._closed or (user_message and not self._accepting_user_messages):
+                return MailboxAdmissionResult.STOPPING
             if user_message and len(self._messages) >= self._capacity:
+                if report_full:
+                    return MailboxAdmissionResult.FULL
                 raise MailboxCapacityExceeded("User mailbox is full")
             if self._scheduled or (
                 user_message and not self._actor.can_process_user_messages()
             ):
                 target.append(message)
-                return
+                return MailboxAdmissionResult.ACCEPTED
             entry = _Entry(message)
             target.append(entry)
             self._scheduled = True
@@ -89,18 +104,26 @@ class DefaultMailbox(Mailbox):
             if publish_fallback:
                 self._dispatcher.dispatch_system(self)
             if lifecycle_accepted:
-                return
+                return MailboxAdmissionResult.ACCEPTED
             raise
+        return MailboxAdmissionResult.ACCEPTED
 
     def close(self) -> None:
         with self._lock:
+            self._accepting_user_messages = False
             self._closed = True
             self._messages.clear()
             self._system_messages.clear()
 
-    def stop_user_messages(self) -> None:
+    def stop_user_messages(self) -> list:
         with self._lock:
+            self._accepting_user_messages = False
+            messages = [
+                item.message if isinstance(item, _Entry) else item
+                for item in self._messages
+            ]
             self._messages.clear()
+            return messages
 
     def __call__(self) -> None:
         with self._lock:

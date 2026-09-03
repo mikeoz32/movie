@@ -62,9 +62,7 @@ class SafeCollector:
 @pytest.fixture
 def actor_system():
     class Root(AbstractBehavior[None]):
-        def receive(
-            self, context: ActorContext, message: None
-        ) -> "AbstractBehavior | None":
+        def receive(self, context: ActorContext, message: None) -> "AbstractBehavior | None":
             return None
 
     system = ActorSystem.create(Behaviors.setup(Root), "streams-test-system")
@@ -97,6 +95,19 @@ def test_collect_materialized(actor_system: ActorSystem):
 
     result = result_future.result(timeout=1)
     assert result == [0, 3, 6, 9, 12]
+    wait_for_actor_count(actor_system, 2)
+
+
+def test_flow_can_be_materialized_concurrently(actor_system: ActorSystem):
+    shared_flow = Flow.map(lambda value: value * 2, name="shared-flow")
+    first_sink, first_result = Sink.collect()
+    second_sink, second_result = Sink.collect()
+
+    Source.from_iterable([1, 2]).via(shared_flow).to(first_sink).run(actor_system)
+    Source.from_iterable([3, 4]).via(shared_flow).to(second_sink).run(actor_system)
+
+    assert first_result.result(timeout=1.0) == [2, 4]
+    assert second_result.result(timeout=1.0) == [6, 8]
     wait_for_actor_count(actor_system, 2)
 
 
@@ -289,9 +300,7 @@ def test_base_exception_in_stream_user_code_is_terminal(actor_system: ActorSyste
         raise KeyboardInterrupt("stop map")
 
     sink, materialized = Sink.collect()
-    run_result = Source.from_iterable([1]).via(Flow.map(interrupt)).to(sink).run(
-        actor_system
-    )
+    run_result = Source.from_iterable([1]).via(Flow.map(interrupt)).to(sink).run(actor_system)
     assert run_result.ready.result(timeout=1.0) is None
 
     with pytest.raises(RuntimeError, match="transform raised BaseException") as raised:

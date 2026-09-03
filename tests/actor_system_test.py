@@ -1,4 +1,6 @@
 import time
+import uuid
+from queue import Queue
 from threading import Event, RLock, Thread
 
 import pytest
@@ -10,12 +12,35 @@ from movie.actor import (
     Behaviors,
     SupervisorDirective,
 )
+from movie.actor.dead_letter import RemoteAdmissionResult
+from movie.actor.identity import ActorIdentity
+from movie.actor.impl.ref import ActorCell
 from movie.actor.impl.system import ActorSystemImpl
 from movie.actor.ref import ActorRef
 from movie.config import Config
 from movie.dispatch.worker_pool import WorkerPoolDispatcherImpl
+from movie.mailbox.mailbox import MailboxAdmissionResult
 
 SystemMessage = ActorSystem.SystemMessage
+
+
+def test_local_custom_implementation_does_not_require_remoting_keyword(monkeypatch):
+    created = []
+
+    class LegacyImplementation:
+        def __init__(self, behavior, name, *, config=None):
+            created.append((behavior, name, config))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(ActorSystem, "_impl", LegacyImplementation)
+    behavior = Behaviors.receive(lambda context, message: Behaviors.same)
+
+    system = ActorSystem.create(behavior, "legacy-implementation")
+
+    assert isinstance(system, LegacyImplementation)
+    assert created == [(behavior, "legacy-implementation", None)]
 
 
 def test_actor_system_creation():
@@ -890,6 +915,207 @@ def test_timed_out_startup_rollback_finishes_after_setup_unblocks():
     assert system._terminated.wait(2.0)
     assert system._state.name == "STOPPED"
     assert system.actor_count == 0
+
+
+def test_remote_admission_resolves_identity_and_canonical_path() -> None:
+    received = Event()
+    messages: list[str] = []
+
+    def receive(context: ActorContext, message: str):
+        messages.append(message)
+        received.set()
+        return Behaviors.same
+
+    system = ActorSystem.create(Behaviors.receive(receive), "remote-admission-system")
+    try:
+        target = system._root_ref
+        assert system.resolve_actor(target.identity, target.path.canonical) is target
+        assert (
+            system.admit_remote_message(target.identity, "accepted")
+            is RemoteAdmissionResult.ACCEPTED
+        )
+        assert received.wait(1.0)
+        assert messages == ["accepted"]
+
+        wrong_path = target.path._parent.child("other")
+        assert system.resolve_actor(target.identity, wrong_path) is None
+        unknown = ActorIdentity(system.incarnation_uid, uuid.uuid4())
+        assert (
+            system.admit_remote_message(unknown, "unknown")
+            is RemoteAdmissionResult.ACTOR_NOT_FOUND
+        )
+    finally:
+        system.stop()
+
+
+def test_remote_admission_reports_mailbox_full_without_changing_tell_behavior() -> None:
+    entered = Event()
+    release = Event()
+    config = Config(
+        {
+            "movie": {
+                "mailbox": {"default": {"capacity": 1}},
+                "dispatcher": {
+                    "default-dispatcher": {
+                        "type": "movie.dispatch.worker_pool.WorkerPoolDispatcherImpl",
+                        "workers": 1,
+                    }
+                },
+            }
+        }
+    )
+    system = ActorSystem.create(
+        Behaviors.receive(lambda context, message: Behaviors.same),
+        "full-admission-system",
+        config=config,
+    )
+    dispatcher = system._dispatchers.default_dispatcher
+    dispatcher.dispatch(lambda: (entered.set(), release.wait(2.0)))
+    assert entered.wait(1.0)
+    target = system._root_ref
+    try:
+        assert (
+            system.admit_remote_message(target.identity, "accepted")
+            is RemoteAdmissionResult.ACCEPTED
+        )
+        assert (
+            system.admit_remote_message(target.identity, "full")
+            is RemoteAdmissionResult.MAILBOX_FULL
+        )
+        with pytest.raises(RuntimeError, match="mailbox is full"):
+            target.tell("public-tell-remains-raising")
+    finally:
+        release.set()
+        system.stop()
+
+
+def test_remote_admission_reports_actor_stopping_while_actor_is_registered() -> None:
+    child_entered = Event()
+    child_release = Event()
+    child_ref: list[ActorRef] = []
+
+    class Child(AbstractBehavior[str]):
+        def receive(self, context: ActorContext, message: str):
+            child_entered.set()
+            child_release.wait(2.0)
+            return self
+
+    class Parent(AbstractBehavior[str]):
+        def __init__(self, context: ActorContext[str]) -> None:
+            super().__init__(context)
+            child_ref.append(context.spawn(Behaviors.setup(Child), "child"))
+
+        def receive(self, context: ActorContext, message: str):
+            return self
+
+    system = ActorSystem.create(Behaviors.setup(Parent), "stopping-admission-system")
+    target = system._root_ref
+    child_ref[0].tell("block")
+    assert child_entered.wait(1.0)
+    system.terminate(target)
+    context = system.get_context(target)
+    deadline = time.monotonic() + 1.0
+    while context.state.name != "STOPPING" and time.monotonic() < deadline:
+        time.sleep(0.001)
+    try:
+        assert context.state.name == "STOPPING"
+        assert system.lookup_actor_by_uid(target.id) is target
+        assert (
+            system.admit_remote_message(target.identity, "late")
+            is RemoteAdmissionResult.ACTOR_STOPPING
+        )
+    finally:
+        child_release.set()
+        system.stop()
+
+
+def test_actor_cell_never_holds_its_lock_while_calling_mailbox_admission() -> None:
+    admission_entered = Event()
+    admission_release = Event()
+    mailbox_stopped = Event()
+
+    class BlockingMailbox:
+        def try_send(self, message) -> MailboxAdmissionResult:
+            admission_entered.set()
+            admission_release.wait(2.0)
+            return MailboxAdmissionResult.ACCEPTED
+
+        def stop_user_messages(self) -> list:
+            mailbox_stopped.set()
+            return []
+
+        def send(self, message) -> None: ...
+
+        def sendSystem(self, message) -> None: ...
+
+        def close(self) -> None: ...
+
+    cell: ActorCell[str] = ActorCell()
+    cell.attach(BlockingMailbox())
+    admission = Thread(target=lambda: cell.admit("message"))
+    admission.start()
+    assert admission_entered.wait(1.0)
+
+    stopper = Thread(target=cell.stop_user_messages)
+    stopper.start()
+    assert mailbox_stopped.wait(1.0)
+    admission_release.set()
+    admission.join(1.0)
+    stopper.join(1.0)
+
+    assert not admission.is_alive()
+    assert not stopper.is_alive()
+    assert cell.admit("after-stop") is MailboxAdmissionResult.STOPPING
+
+
+def test_remote_admission_racing_actor_termination_always_settles() -> None:
+    system = ActorSystem.create(
+        Behaviors.receive(lambda context, message: Behaviors.same),
+        "concurrent-admission-stop-system",
+    )
+    target = system.spawn(
+        Behaviors.receive(lambda context, message: Behaviors.same), "target"
+    )
+    stopped = system.actor_stop_future(target)
+    publishers = 8
+    attempts = 100
+    ready = Event()
+    results: Queue[RemoteAdmissionResult] = Queue()
+
+    def publish_batch(offset: int) -> None:
+        ready.wait(1.0)
+        for sequence in range(attempts):
+            results.put(
+                system.admit_remote_message(target.identity, offset + sequence)
+            )
+
+    threads = [
+        Thread(target=publish_batch, args=(publisher * attempts,))
+        for publisher in range(publishers)
+    ]
+    for thread in threads:
+        thread.start()
+    terminator = Thread(target=lambda: (ready.wait(1.0), system.terminate(target)))
+    terminator.start()
+    ready.set()
+    for thread in threads:
+        thread.join(2.0)
+    terminator.join(2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert not terminator.is_alive()
+    assert stopped.result(timeout=1.0) is None
+    settled = [results.get_nowait() for _ in range(publishers * attempts)]
+    assert set(settled) <= {
+        RemoteAdmissionResult.ACCEPTED,
+        RemoteAdmissionResult.ACTOR_STOPPING,
+        RemoteAdmissionResult.ACTOR_NOT_FOUND,
+    }
+    assert (
+        system.admit_remote_message(target.identity, "after-stop")
+        is RemoteAdmissionResult.ACTOR_NOT_FOUND
+    )
+    system.stop()
 
 
 def _start_and_capture(system: ActorSystemImpl, errors: list[Exception]) -> None:

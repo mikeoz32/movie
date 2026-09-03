@@ -6,6 +6,10 @@ stash-capacity = 10000
 callback-workers = 4
 max-actors = 100000
 
+[movie.actor.dead-letters]
+capacity = 1000
+max-subscriptions = 1000
+
 [movie.dispatcher.default-dispatcher]
 type = "movie.dispatch.worker_pool.WorkerPoolDispatcherImpl"
 workers = 8
@@ -17,3 +21,28 @@ system-queue-capacity = 100000
 type = "movie.mailbox.default.DefaultMailbox"
 capacity = 100000
 throughput = 100
+
+[movie.io.asyncio]
+startup-timeout = 10
+command-capacity = 1024
+event-loop-count = 1
+
+[movie.io.tcp]
+operation-limit = 1024
+write-message-limit = 1024
+write-byte-limit = 4194304
+write-batch-message-limit = 64
+write-batch-byte-limit = 262144
+write-batch-delay-ms = 1
+read-chunk-bytes = 65536
+backlog = 128
+connect-timeout = 10
+
+[movie.http.server]
+max-request-line-bytes = 8192
+max-header-bytes = 32768
+max-header-count = 100
+max-body-bytes = 1048576
+max-buffer-bytes = 2097152
+max-pipelined-requests = 32
+response-buffer = 16

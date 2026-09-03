@@ -191,6 +191,9 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
         finally:
             try:
                 if self._parent is not None:
+                    parent_context = self._system.get_context(self._parent)
+                    if parent_context is not None:
+                        parent_context.remove_child(self._ref)
                     self._send_system(self._parent, ActorSystem.Terminated(self._ref))
             finally:
                 self._ref.close()

@@ -1,14 +1,28 @@
 # Public API
+from __future__ import annotations
+
 import sys
+import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Protocol, Union
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, Union
 
 from movie.actor.behaviour import AbstractBehavior
 from movie.actor.context import ActorContext
+from movie.actor.dead_letter import DeadLetter, DeadLetterBroker, RemoteAdmissionResult
+from movie.actor.extension import Extension, ExtensionId
+from movie.actor.identity import ActorIdentity, ActorSystemIncarnationUid
 from movie.actor.message import MessageType
+from movie.actor.path import ActorPath
 from movie.actor.ref import ActorRef, InternalActorRef
 from movie.config import Config
+
+if TYPE_CHECKING:
+    from movie.remoting.config import RemotingConfig
+    from movie.remoting.runtime import RemotingRuntime
+
+
+E = TypeVar("E", bound=Extension)
 
 
 class ClassLoader:
@@ -81,12 +95,24 @@ class ActorSystem(ActorRef[MessageType], Protocol):
     @property
     def actor_count(self) -> int: ...
 
+    @property
+    def incarnation_uid(self) -> ActorSystemIncarnationUid: ...
+
+    @property
+    def dead_letters(self) -> DeadLetterBroker[DeadLetter]: ...
+
+    @property
+    def remoting(self) -> RemotingRuntime | None: ...
+
+    def extension(self, extension_id: ExtensionId[E]) -> E: ...
+
     @staticmethod
     def create(
         behavior: AbstractBehavior[MessageType],
         name: str,
         *,
         config: Config | None = None,
+        remoting: RemotingConfig | None = None,
     ) -> "ActorSystem":
         is_gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)
         if (
@@ -104,7 +130,15 @@ class ActorSystem(ActorRef[MessageType], Protocol):
             except ImportError as e:
                 raise NotImplementedError("No ActorSystem implementation available", e)
 
-        system = ActorSystem._impl(behavior, name, config=config)
+        if remoting is None:
+            system = ActorSystem._impl(behavior, name, config=config)
+        else:
+            system = ActorSystem._impl(
+                behavior,
+                name,
+                config=config,
+                remoting=remoting,
+            )
         system.start()
         return system
 
@@ -136,7 +170,7 @@ class ExtendedActorSystem(ActorSystem[MessageType], Protocol):
     Extended api for extensions
     """
 
-    ...
+    pass
 
 
 # Internal API
@@ -148,3 +182,19 @@ class InternalActorSystem(ExtendedActorSystem[MessageType], Protocol):
         *,
         parent: ActorContext | None = None,
     ) -> InternalActorRef[MessageType]: ...
+
+    def lookup_actor_by_uid(self, actor_uid: uuid.UUID) -> ActorRef[Any] | None: ...
+
+    def lookup_actor_by_path(self, path: ActorPath | str) -> ActorRef[Any] | None: ...
+
+    def resolve_actor(
+        self, identity: ActorIdentity, path: ActorPath | str
+    ) -> ActorRef[Any] | None: ...
+
+    def admit_remote_message(
+        self, identity: ActorIdentity, message: Any, **metadata: Any
+    ) -> RemoteAdmissionResult: ...
+
+    def resolve_remote_path(
+        self, path: ActorPath | str
+    ) -> tuple[RemoteAdmissionResult, ActorRef[Any] | None]: ...

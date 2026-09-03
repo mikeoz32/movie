@@ -1,0 +1,114 @@
+services:
+  movie:
+    build:
+      context: .
+      dockerfile: Dockerfile.benchmark
+    init: true
+    command:
+      - python
+      - -m
+      - benchmarks.http_server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --connections
+      - ${LOCUST_USERS:-3200}
+      - --workers
+      - ${MOVIE_WORKERS:-8}
+      - --io-event-loops
+      - ${MOVIE_IO_EVENT_LOOPS:-2}
+    expose:
+      - "8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request; response = urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=1); raise SystemExit(response.status != 200 or response.read() != b'ready')
+      interval: 60s
+      start_interval: 1s
+      start_period: 30s
+      timeout: 2s
+      retries: 3
+    stop_grace_period: 25s
+
+  locust-master:
+    image: locustio/locust:2.46.4@sha256:28d2ed4b530819309d9b4839b39845795109c1201d74a53b3470ab3c8d8b95ef
+    init: true
+    user: ${LOCUST_UID:-1000}:${LOCUST_GID:-1000}
+    depends_on:
+      movie:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ./benchmarks/locustfile.py
+        target: /mnt/locust/locustfile.py
+        read_only: true
+      - type: bind
+        source: ./results
+        target: /results
+    command:
+      - -f
+      - /mnt/locust/locustfile.py
+      - --master
+      - --headless
+      - --expect-workers
+      - ${LOCUST_WORKERS:-6}
+      - --expect-workers-max-wait
+      - "60"
+      - --host
+      - http://movie:8080
+      - --users
+      - ${LOCUST_USERS:-3200}
+      - --spawn-rate
+      - ${LOCUST_SPAWN_RATE:-100}
+      - --run-time
+      - ${LOCUST_RUN_TIME:-60s}
+      - --reset-stats
+      - --only-summary
+      - --csv
+      - /results/${LOCUST_OUTPUT:-http-locust-u3200-r100-w6}
+      - --exit-code-on-error
+      - "1"
+
+  locust-worker:
+    image: locustio/locust:2.46.4@sha256:28d2ed4b530819309d9b4839b39845795109c1201d74a53b3470ab3c8d8b95ef
+    init: true
+    user: ${LOCUST_UID:-1000}:${LOCUST_GID:-1000}
+    scale: ${LOCUST_WORKERS:-6}
+    depends_on:
+      movie:
+        condition: service_healthy
+      locust-master:
+        condition: service_started
+    volumes:
+      - type: bind
+        source: ./benchmarks/locustfile.py
+        target: /mnt/locust/locustfile.py
+        read_only: true
+    command:
+      - -f
+      - /mnt/locust/locustfile.py
+      - --worker
+      - --master-host
+      - locust-master
+      - --host
+      - http://movie:8080
+      - --reset-stats
+
+  movie-stop:
+    image: locustio/locust:2.46.4@sha256:28d2ed4b530819309d9b4839b39845795109c1201d74a53b3470ab3c8d8b95ef
+    init: true
+    depends_on:
+      movie:
+        condition: service_healthy
+      locust-master:
+        condition: service_completed_successfully
+    entrypoint:
+      - python
+    command:
+      - -c
+      - >-
+        import urllib.request; request = urllib.request.Request('http://movie:8080/shutdown', method='POST'); response = urllib.request.urlopen(request, timeout=5); raise SystemExit(response.status != 200 or response.read() != b'stopping')

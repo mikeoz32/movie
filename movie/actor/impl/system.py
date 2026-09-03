@@ -7,26 +7,39 @@ from logging import Formatter, Logger, StreamHandler, handlers
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread, local
 from time import monotonic, sleep
-from typing import Any, Callable, Dict, Generic, Protocol, Type, TypeVar, cast
+from typing import Any, Dict, TypeVar, cast
 
 from movie.actor import ActorSystem
 from movie.actor.behaviour import AbstractBehavior, Behaviors
 from movie.actor.context import ActorContext
+from movie.actor.dead_letter import (
+    DeadLetter,
+    DeadLetterBroker,
+    DeadLetterReason,
+    RemoteAdmissionResult,
+    admission_dead_letter_reason,
+)
+from movie.actor.extension import Extension, ExtensionId, ExtensionRegistry
+from movie.actor.identity import ActorIdentity, ActorSystemIncarnationUid, new_incarnation_uid
 from movie.actor.impl.context import LocalActorContext
 from movie.actor.impl.ref import LocalActorRef
 from movie.actor.logger import ActorLogger
 from movie.actor.message import MessageType
-from movie.actor.path import Address, RootActorPath
+from movie.actor.path import (
+    ActorPath,
+    Address,
+    RootActorPath,
+    is_remote_actor_path,
+    parse_actor_path,
+)
 from movie.actor.ref import ActorRef
 from movie.actor.system import InternalActorSystem
 from movie.config import Config
 from movie.dispatch.manager import DispatcherManager
 from movie.future import CallbackExecutor
 from movie.mailbox.manager import MailboxManager
-
-
-class Extension(Protocol): ...
-
+from movie.remoting.config import RemotingConfig
+from movie.remoting.runtime import RemotingRuntime
 
 E = TypeVar("E", bound=Extension)
 
@@ -58,35 +71,6 @@ class DeadlineQueueListener(handlers.QueueListener):
         return True
 
 
-class ExtensionId(Generic[E]): ...
-
-
-class ExtensionRegisrty:
-    def __init__(self, system: InternalActorSystem) -> None:
-        self._system = system
-        self._by_type: Dict[Type[Extension], Any] = {}
-        self._by_id: Dict[ExtensionId[Any], Any] = {}
-        self._lock = RLock()
-
-    def get(self, ext_type: Type[E]) -> E:
-        with self._lock:
-            ext = self._by_type.get(ext_type, None)
-            if ext is None:
-                raise ValueError(f"Extension of type {ext_type} not found")
-            return cast(E, ext)
-
-    def get_or_register(
-        self, ext_id: ExtensionId[E], factory: Callable[["ActorSystem"], E]
-    ) -> E:
-        with self._lock:
-            ext = self._by_id.get(ext_id, None)
-            if ext is None:
-                ext = factory(self._system)
-                self._by_id[ext_id] = ext
-                self._by_type[type(ext)] = ext
-            return cast(E, ext)
-
-
 class RootGuardianBehavior(AbstractBehavior[Any]):
     def __init__(self, context: ActorContext[Any]) -> None:
         super().__init__(context)
@@ -105,6 +89,7 @@ class ActorRegistry:
         self._user_guardian: ActorRef | None = None
         self._system_guardian: ActorRef | None = None
         self._actors: Dict[uuid.UUID, "LocalActorContext"] = {}
+        self._paths: Dict[str, uuid.UUID] = {}
         self._system = system
         self._lock = RLock()
 
@@ -112,9 +97,7 @@ class ActorRegistry:
         with self._lock:
             if len(self._actors) >= self._system._max_actors:
                 raise RuntimeError("Actor system capacity exceeded")
-        ref = LocalActorRef(
-            self._system, RootActorPath(Address("movie", self._system.name))
-        )
+        ref = self._new_ref(RootActorPath(Address("movie", self._system.name)))
         context = LocalActorContext(
             RootGuardianBehavior.create(), ref, self._system, None
         )
@@ -122,6 +105,8 @@ class ActorRegistry:
         with self._lock:
             self._root_guardian = ref
             self._actors[ref.id] = context
+            if ref.path.is_remote_resolvable:
+                self._paths[ref.path.remote_path] = ref.id
         try:
             context.start()
             self._system.wait_for_actor_start(ref)
@@ -151,14 +136,15 @@ class ActorRegistry:
             parent = parent or cast(
                 LocalActorContext, self._actors[self._root_guardian.id]
             )
-            ref = LocalActorRef(
-                self._system,
-                parent.get_self().path.child(name),
-            )
+            ref = self._new_ref(parent.get_self().path.child(name))
             context = LocalActorContext(
                 behavior, ref, self._system, cast(LocalActorContext, parent)
             )
+            if ref.path.is_remote_resolvable and ref.path.remote_path in self._paths:
+                raise ValueError(f"Actor path '{ref.path.remote_path}' is already in use")
             self._actors[ref.id] = context
+            if ref.path.is_remote_resolvable:
+                self._paths[ref.path.remote_path] = ref.id
         try:
             context.start()
         except BaseException as error:
@@ -172,6 +158,7 @@ class ActorRegistry:
     def clear(self) -> None:
         with self._lock:
             self._actors.clear()
+            self._paths.clear()
             self._root_guardian = None
 
     @property
@@ -180,17 +167,81 @@ class ActorRegistry:
             return self._root_guardian
 
     def get(self, ref: ActorRef) -> "LocalActorContext | None":
+        if not isinstance(ref, LocalActorRef) or not ref.belongs_to(self._system):
+            return None
         with self._lock:
-            return self._actors.get(ref.id)
+            context = self._actors.get(ref.id)
+            if context is None or context.ref is not ref:
+                return None
+            return context
+
+    def get_by_uid(self, actor_uid: uuid.UUID) -> LocalActorRef | None:
+        with self._lock:
+            context = self._actors.get(actor_uid)
+            return context.ref if context is not None else None
+
+    def get_by_path(self, path: ActorPath | str) -> LocalActorRef | None:
+        canonical = self._canonical_path(path)
+        if canonical is None:
+            return None
+        with self._lock:
+            actor_uid = self._paths.get(canonical)
+            context = self._actors.get(actor_uid) if actor_uid is not None else None
+            return context.ref if context is not None else None
+
+    def resolve_identity(self, identity: ActorIdentity) -> LocalActorRef | None:
+        if identity.system_incarnation_uid != self._system.incarnation_uid:
+            return None
+        with self._lock:
+            context = self._actors.get(identity.actor_uid)
+            if context is None or context.ref.identity != identity:
+                return None
+            return context.ref
 
     def unregister(self, ref: ActorRef) -> None:
+        if not isinstance(ref, LocalActorRef) or not ref.belongs_to(self._system):
+            return
         with self._lock:
-            self._actors.pop(ref.id, None)
+            context = self._actors.get(ref.id)
+            if context is None or context.ref is not ref:
+                return
+            self._actors.pop(ref.id)
+            if self._paths.get(ref.path.remote_path) == ref.id:
+                self._paths.pop(ref.path.remote_path)
 
     @property
     def actor_count(self) -> int:
         with self._lock:
             return len(self._actors)
+
+    def _new_ref(self, path: ActorPath) -> LocalActorRef:
+        while True:
+            ref = LocalActorRef(self._system, path)
+            if ref.id not in self._actors:
+                return ref
+
+    def _canonical_path(self, path: ActorPath | str) -> str | None:
+        if isinstance(path, ActorPath):
+            if (
+                not path.is_remote_resolvable
+                or path.address.protocol != "movie"
+                or path.address.system != self._system.name
+            ):
+                return None
+            return path.remote_path
+        if is_remote_actor_path(path):
+            return path
+        try:
+            parsed = parse_actor_path(path)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not parsed.is_remote_resolvable
+            or parsed.address.protocol != "movie"
+            or parsed.address.system != self._system.name
+        ):
+            return None
+        return parsed.remote_path
 
 
 class SystemState(Enum):
@@ -213,13 +264,28 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         else:
             raise ValueError("Actor system has not been started yet")
 
+    @property
+    def identity(self) -> ActorIdentity:
+        if self._root_ref is None:
+            raise ValueError("Actor system has not been started yet")
+        return self._root_ref.identity
+
+    @property
+    def path(self) -> ActorPath:
+        if self._root_ref is None:
+            raise ValueError("Actor system has not been started yet")
+        return self._root_ref.path
+
     def __init__(
         self,
         root_behavior: AbstractBehavior,
         name: str,
         *,
         config: Config | None = None,
+        remoting: RemotingConfig | None = None,
     ) -> None:
+        self._name = name
+        self._incarnation_uid = new_incarnation_uid()
         configured_path = os.environ.get("MOVIE_CONFIG")
         if config is not None:
             loaded_config = config
@@ -234,6 +300,12 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         shutdown_timeout = self._config.get_int("movie.actor.shutdown-timeout", 10)
         callback_workers = self._config.get_int("movie.actor.callback-workers", 4)
         max_actors = self._config.get_int("movie.actor.max-actors", 100_000)
+        dead_letter_capacity = self._config.get_int(
+            "movie.actor.dead-letters.capacity", 1_000
+        )
+        dead_letter_subscriptions = self._config.get_int(
+            "movie.actor.dead-letters.max-subscriptions", 1_000
+        )
         if startup_timeout is None or startup_timeout <= 0:
             raise ValueError("Actor startup timeout must be positive")
         if shutdown_timeout is None or shutdown_timeout <= 0:
@@ -242,6 +314,15 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
             raise ValueError("Future callback worker count must be positive")
         if max_actors is None or max_actors < 2:
             raise ValueError("Actor capacity must allow the guardian and root actor")
+        if (
+            dead_letter_capacity is None
+            or dead_letter_capacity <= 0
+            or dead_letter_subscriptions is None
+            or dead_letter_subscriptions <= 0
+        ):
+            raise ValueError(
+                "Dead-letter capacity and subscription limit must be positive"
+            )
         dispatcher_config = self._config.get_config(
             "movie.dispatcher.default-dispatcher"
         )
@@ -260,13 +341,16 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         self._startup_timeout = float(startup_timeout)
         self._shutdown_timeout = float(shutdown_timeout)
         self._max_actors = max_actors
-        self._extensions = ExtensionRegisrty(self)
+        self._extensions = ExtensionRegistry(self)
         self._dispatchers = DispatcherManager(self._config)
         self._mailboxes = MailboxManager(self._config)
         self._root_behavior = root_behavior
         self._root_ref: ActorRef | None = None
-        self._name = name
         self._actor_registry = ActorRegistry(self)
+        self._dead_letters: DeadLetterBroker[DeadLetter] = DeadLetterBroker(
+            dead_letter_capacity, dead_letter_subscriptions
+        )
+        self._remoting = RemotingRuntime(self, remoting) if remoting is not None else None
         self._lifecycle_lock = RLock()
         self._stop_lock = Lock()
         self._state = SystemState.NEW
@@ -295,6 +379,9 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         logger = ActorLogger(self._actor_log, {})
         logger.set_context(ctx)
         return logger
+
+    def extension(self, extension_id: ExtensionId[E]) -> E:
+        return self._extensions.get(extension_id)
 
     def setup_logger(self) -> None:
         self._actor_log = Logger(f"movie.actor.{self._name}")
@@ -325,6 +412,7 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
 
         try:
             self._actor_registry.start()
+            self._extensions.activate()
             self._root_ref = self.spawn(self._root_behavior, self._name)
             context = self.get_context(self._root_ref)
             startup_timeout = self._startup_timeout
@@ -334,6 +422,8 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
                 )
             if context.startup_error is not None:
                 raise RuntimeError("Root actor failed during startup") from context.startup_error
+            if self._remoting is not None:
+                self._remoting.start()
         except BaseException as startup_error:
             try:
                 self._shutdown(self._configured_shutdown_timeout())
@@ -395,25 +485,54 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
                 self._state = SystemState.STOPPING
             finally:
                 self._lifecycle_lock.release()
+            shutdown_error: BaseException | None = None
+            if self._remoting is not None:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    shutdown_error = TimeoutError(
+                        f"Actor system did not stop within {timeout} seconds"
+                    )
+                else:
+                    try:
+                        self._remoting.stop(remaining)
+                    except BaseException as error:
+                        shutdown_error = error
             guardian = self._actor_registry.root_guardian
             context = self.get_context(guardian) if guardian is not None else None
 
             if guardian is not None and context is not None:
-                while not context.is_stopped:
-                    try:
-                        guardian.tell_system(ActorSystem.Stop())
-                        break
-                    except RuntimeError as error:
-                        if monotonic() >= deadline:
-                            raise TimeoutError(
-                                f"Actor system did not stop within {timeout} seconds"
-                            ) from error
-                        sleep(0.001)
-                remaining = max(0.0, deadline - monotonic())
-                if not context.wait_stopped(remaining):
-                    raise TimeoutError(
-                        f"Actor system did not stop within {timeout} seconds"
-                    )
+                try:
+                    while not context.is_stopped:
+                        try:
+                            guardian.tell_system(ActorSystem.Stop())
+                            break
+                        except RuntimeError as error:
+                            if monotonic() >= deadline:
+                                raise TimeoutError(
+                                    f"Actor system did not stop within {timeout} seconds"
+                                ) from error
+                            sleep(0.001)
+                    remaining = max(0.0, deadline - monotonic())
+                    if not context.wait_stopped(remaining):
+                        raise TimeoutError(
+                            f"Actor system did not stop within {timeout} seconds"
+                        )
+                except BaseException as error:
+                    if shutdown_error is None:
+                        shutdown_error = error
+                    else:
+                        shutdown_error.add_note(
+                            f"Local actor shutdown also failed: {error!r}"
+                        )
+            if shutdown_error is not None:
+                raise shutdown_error
+
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Actor system did not stop within {timeout} seconds"
+                )
+            self._extensions.stop_all(remaining)
 
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -528,6 +647,80 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
     def get_context(self, ref: ActorRef) -> "LocalActorContext | None":
         return self._actor_registry.get(ref)
 
+    def lookup_actor_by_uid(self, actor_uid: uuid.UUID) -> ActorRef | None:
+        return self._actor_registry.get_by_uid(actor_uid)
+
+    def lookup_actor_by_path(self, path: ActorPath | str) -> ActorRef | None:
+        return self._actor_registry.get_by_path(path)
+
+    def resolve_actor(
+        self, identity: ActorIdentity, path: ActorPath | str
+    ) -> ActorRef | None:
+        by_identity = self._actor_registry.resolve_identity(identity)
+        if by_identity is None:
+            return None
+        by_path = self._actor_registry.get_by_path(path)
+        return by_identity if by_path is by_identity else None
+
+    def admit_remote_message(
+        self, identity: ActorIdentity, message: Any, **metadata: Any
+    ) -> RemoteAdmissionResult:
+        ref = self._actor_registry.resolve_identity(identity)
+        if ref is None:
+            result = RemoteAdmissionResult.ACTOR_NOT_FOUND
+        else:
+            result = ref.admit_remote_message(message)
+        if result is not RemoteAdmissionResult.ACCEPTED:
+            self._publish_dead_letter(
+                identity,
+                admission_dead_letter_reason(result),
+                recipient_path=ref.path.canonical if ref is not None else None,
+                **metadata,
+            )
+        return result
+
+    def resolve_remote_path(
+        self, path: ActorPath | str
+    ) -> tuple[RemoteAdmissionResult, ActorRef | None]:
+        ref = self._actor_registry.get_by_path(path)
+        if ref is None:
+            return RemoteAdmissionResult.ACTOR_NOT_FOUND, None
+        context = self._actor_registry.get(ref)
+        if context is None:
+            return RemoteAdmissionResult.ACTOR_NOT_FOUND, None
+        if context.state.name in ("STOPPING", "STOPPED"):
+            return RemoteAdmissionResult.ACTOR_STOPPING, None
+        return RemoteAdmissionResult.ACCEPTED, ref
+
+    def _publish_dead_letter(
+        self,
+        recipient: ActorIdentity,
+        reason: DeadLetterReason,
+        *,
+        message: Any | None = None,
+        recipient_path: str | None = None,
+        association_uid: uuid.UUID | None = None,
+        lane_id: int | None = None,
+        lane_sequence: int | None = None,
+        serializer_id: int | None = None,
+        manifest: str | None = None,
+        payload_byte_length: int | None = None,
+    ) -> None:
+        self._dead_letters.publish(
+            DeadLetter(
+                recipient=recipient,
+                reason=reason,
+                message=message,
+                recipient_path=recipient_path,
+                association_uid=association_uid,
+                lane_id=lane_id,
+                lane_sequence=lane_sequence,
+                serializer_id=serializer_id,
+                manifest=manifest,
+                payload_byte_length=payload_byte_length,
+            )
+        )
+
     def unregister_actor(self, ref: ActorRef) -> None:
         self._actor_registry.unregister(ref)
 
@@ -563,6 +756,18 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
     @property
     def actor_count(self) -> int:
         return self._actor_registry.actor_count
+
+    @property
+    def incarnation_uid(self) -> ActorSystemIncarnationUid:
+        return self._incarnation_uid
+
+    @property
+    def dead_letters(self) -> DeadLetterBroker[DeadLetter]:
+        return self._dead_letters
+
+    @property
+    def remoting(self) -> RemotingRuntime | None:
+        return self._remoting
 
     @property
     def name(self) -> str:

@@ -34,7 +34,13 @@ class MailboxManager:
         instance = mailbox_class(dispatcher, actor, mailbox_config)
         if not all(
             hasattr(instance, method)
-            for method in ("send", "sendSystem", "stop_user_messages", "close")
+            for method in (
+                "send",
+                "try_send",
+                "sendSystem",
+                "stop_user_messages",
+                "close",
+            )
         ):
             raise TypeError(f"Configured mailbox '{mailbox}' does not implement Mailbox")
         return instance

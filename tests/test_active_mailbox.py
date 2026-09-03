@@ -1,10 +1,13 @@
 from collections import deque
+from queue import Queue
+from threading import Barrier, Thread
 
 import pytest
 
 from movie.actor.context import ActorBatchFailed
 from movie.config import Config
 from movie.mailbox.default import DefaultMailbox, MailboxCapacityExceeded
+from movie.mailbox.mailbox import MailboxAdmissionResult
 
 
 class ManualDispatcher:
@@ -181,6 +184,47 @@ def test_mailbox_rejects_overload() -> None:
     mailbox.send("accepted")
     with pytest.raises(MailboxCapacityExceeded, match="User mailbox is full"):
         mailbox.send("rejected")
+
+
+def test_nonblocking_admission_reports_full_and_stopping() -> None:
+    mailbox = DefaultMailbox(
+        ManualDispatcher(),
+        RecordingActor(),
+        Config({"capacity": 1, "throughput": 1}),
+    )
+
+    assert mailbox.try_send("accepted") is MailboxAdmissionResult.ACCEPTED
+    assert mailbox.try_send("full") is MailboxAdmissionResult.FULL
+    assert mailbox.stop_user_messages() == ["accepted"]
+    assert mailbox.try_send("stopping") is MailboxAdmissionResult.STOPPING
+
+
+def test_concurrent_admission_never_exceeds_mailbox_capacity() -> None:
+    capacity = 7
+    attempts = 64
+    mailbox = DefaultMailbox(
+        ManualDispatcher(),
+        RecordingActor(),
+        Config({"capacity": capacity, "throughput": 1}),
+    )
+    barrier = Barrier(attempts)
+    results: Queue[MailboxAdmissionResult] = Queue()
+
+    def admit(message: int) -> None:
+        barrier.wait()
+        results.put(mailbox.try_send(message))
+
+    threads = [Thread(target=admit, args=(message,)) for message in range(attempts)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    admitted = [results.get_nowait() for _ in range(attempts)]
+    assert admitted.count(MailboxAdmissionResult.ACCEPTED) == capacity
+    assert admitted.count(MailboxAdmissionResult.FULL) == attempts - capacity
+    assert len(mailbox.stop_user_messages()) == capacity
 
 
 def test_dispatcher_rejection_rolls_back_message() -> None:

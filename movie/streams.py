@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from threading import Lock
 from typing import Callable, Generic, Iterable, List, Tuple, TypeVar
+from uuid import uuid4
 
 from movie.actor import AbstractBehavior, ActorContext, ActorRef, ActorSystem, Behaviors
 from movie.future import RuntimeFuture
@@ -57,9 +58,7 @@ OnEerror = OnError
 Calncel = Cancel
 
 
-StageBehaviorCommand = (
-    Subscribe | SetUpstream | Request | OnNext | OnComplete | OnError | Cancel
-)
+StageBehaviorCommand = Subscribe | SetUpstream | Request | OnNext | OnComplete | OnError | Cancel
 
 _DROP = object()
 _MIN_MAILBOX_CAPACITY = 32
@@ -85,9 +84,7 @@ def _submit_result(system: ActorSystem, future: Future, value) -> None:
     system._submit_completion(lambda: _try_set_result(future, value))
 
 
-def _submit_exception(
-    system: ActorSystem, future: Future, error: Exception
-) -> None:
+def _submit_exception(system: ActorSystem, future: Future, error: Exception) -> None:
     system._submit_completion(lambda: _try_set_exception(future, error))
 
 
@@ -127,9 +124,7 @@ class _GraphLifecycle:
         self._lock = Lock()
         self._state = _GraphState.PENDING
 
-    def spawn(
-        self, factory: Callable[[], AbstractBehavior], name: str
-    ) -> ActorRef:
+    def spawn(self, factory: Callable[[], AbstractBehavior], name: str) -> ActorRef:
         behavior = factory()
         with self._lock:
             if self._state is not _GraphState.PENDING:
@@ -228,9 +223,7 @@ class _GraphLifecycle:
 
 
 class StageBehavior(AbstractBehavior[StageBehaviorCommand]):
-    def __init__(
-        self, ctx: ActorContext, *, prefetch: int = 16, maxbuf: int = 256
-    ) -> None:
+    def __init__(self, ctx: ActorContext, *, prefetch: int = 16, maxbuf: int = 256) -> None:
         super().__init__(ctx)
         self._up: ActorRef | None = None
         self._down: ActorRef | None = None
@@ -259,12 +252,7 @@ class StageBehavior(AbstractBehavior[StageBehaviorCommand]):
             self._lifecycle.fail(error)
 
     def _maybe_pull(self) -> None:
-        if (
-            self._up is None
-            or self._down is None
-            or self._up_closed
-            or self._terminated
-        ):
+        if self._up is None or self._down is None or self._up_closed or self._terminated:
             return
 
         buffered = len(self._buf) + self._in_flight
@@ -411,9 +399,7 @@ class SourceFromIterable(StageBehavior):
                         self._down.tell(OnComplete())
                         return self._stop(context)
                     except BaseException as error:
-                        error = _as_exception(
-                            error, "Stream source iterator raised BaseException"
-                        )
+                        error = _as_exception(error, "Stream source iterator raised BaseException")
                         self._terminated = True
                         self._down.tell(OnError(error))
                         return self._stop(context)
@@ -443,9 +429,7 @@ class FlowMap(StageBehavior, Generic[T, G]):
 
     @staticmethod
     def create(func: Callable[[T], G], prefetch: int = 16, maxbuf: int = 256):
-        return Behaviors.setup(
-            lambda ctx: FlowMap(ctx, func, prefetch=prefetch, maxbuf=maxbuf)
-        )
+        return Behaviors.setup(lambda ctx: FlowMap(ctx, func, prefetch=prefetch, maxbuf=maxbuf))
 
     def transform(self, x: T) -> G:
         return self._func(x)
@@ -502,9 +486,7 @@ class SinkForEach(StageBehavior, Generic[T]):
                 except BaseException as error:
                     error = _as_exception(error, "Stream sink raised BaseException")
                     if self._result_future is not None:
-                        _submit_exception(
-                            context.get_system(), self._result_future, error
-                        )
+                        _submit_exception(context.get_system(), self._result_future, error)
                     if self._up is not None:
                         self._up.tell(Cancel())
                     return self._stop(context)
@@ -514,9 +496,7 @@ class SinkForEach(StageBehavior, Generic[T]):
                 return self._stop(context)
             case OnError(error):
                 if self._result_future is not None:
-                    _submit_exception(
-                        context.get_system(), self._result_future, error
-                    )
+                    _submit_exception(context.get_system(), self._result_future, error)
                 return self._stop(context)
             case Cancel():
                 if self._up is not None:
@@ -541,9 +521,7 @@ class SinkCollect(StageBehavior, Generic[T]):
         self._items: List[T] = []
 
     @staticmethod
-    def create(
-        result_future: Future[List[T]], prefetch: int = 16, maxbuf: int = 256
-    ):
+    def create(result_future: Future[List[T]], prefetch: int = 16, maxbuf: int = 256):
         return Behaviors.setup(
             lambda ctx: SinkCollect(ctx, result_future, prefetch=prefetch, maxbuf=maxbuf)
         )
@@ -666,7 +644,7 @@ class Source(Generic[T]):
         return RunnableGraph(self, sink)
 
 
-class Chained(Source[T], Generic[T, G]):
+class Chained(Source[G], Generic[T, G]):
     def __init__(
         self,
         source: Source[T],
@@ -725,9 +703,7 @@ class RunnableGraph:
                 cancel_hook=lambda: lifecycle.cancel(False),
             )
 
-        stages: List[
-            Tuple[str, Callable[[], AbstractBehavior[StageBehaviorCommand]]]
-        ] = []
+        stages: List[Tuple[str, Callable[[], AbstractBehavior[StageBehaviorCommand]]]] = []
 
         def unwind(node):
             if isinstance(node, Chained):
@@ -742,22 +718,24 @@ class RunnableGraph:
 
         mailbox_capacity = system.config.get_int("movie.mailbox.default.capacity", 100_000)
         if mailbox_capacity is None or mailbox_capacity < _MIN_MAILBOX_CAPACITY:
-            error = ValueError(
-                f"Streams require mailbox capacity >= {_MIN_MAILBOX_CAPACITY}"
-            )
+            error = ValueError(f"Streams require mailbox capacity >= {_MIN_MAILBOX_CAPACITY}")
             if materialized is not None:
                 _try_set_exception(materialized, error)
             raise error
 
         refs = []
         sink_ref: ActorRef | None = None
+        materialization_id = uuid4().hex
 
         try:
             for name, factory in stages:
-                actor_ref = lifecycle.spawn(factory, name)
+                actor_ref = lifecycle.spawn(factory, f"{name}-{materialization_id}")
                 refs.append(actor_ref)
 
-            sink_ref = lifecycle.spawn(sink_factory, sink_name)
+            sink_ref = lifecycle.spawn(
+                sink_factory,
+                f"{sink_name}-{materialization_id}",
+            )
             lifecycle.seal()
         except BaseException as cause:
             error = _as_exception(cause, "Stream stage factory raised BaseException")
