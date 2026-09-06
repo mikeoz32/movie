@@ -17,6 +17,7 @@ from movie.remoting.errors import (
     SerializerRegistryError,
     UnsupportedFeatureError,
     UnsupportedFrameError,
+    UnsupportedHeaderVersionError,
     WrongStreamError,
 )
 from movie.remoting.serialization import (
@@ -33,6 +34,7 @@ HEADER_VERSION = 1
 BOOTSTRAP_MAX_FRAME_BYTES = 1 << 20
 PREAMBLE_SIZE = 23
 COMMON_HEADER_SIZE = 16
+MINIMUM_GOAWAY_FRAME_BYTES = COMMON_HEADER_SIZE + 4
 CONTROL_LANE_ID = 0xFFFF
 MAX_U8 = (1 << 8) - 1
 MAX_U16 = (1 << 16) - 1
@@ -585,7 +587,9 @@ def decode_common_header(
     if flags:
         raise UnsupportedFeatureError(f"unsupported mandatory frame flags 0x{flags:02x}")
     if version != HEADER_VERSION:
-        raise UnsupportedFeatureError(f"unsupported frame header version {version}")
+        raise UnsupportedHeaderVersionError(
+            f"unsupported frame header version {version}"
+        )
     _validate_correlation(frame_type, correlation_id, MalformedFrameError)
     return FrameHeader(frame_length, frame_type, flags, version, correlation_id)
 

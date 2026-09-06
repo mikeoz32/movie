@@ -166,6 +166,13 @@ class TransportConnectionSnapshot:
 
 @runtime_checkable
 class TransportConnection(Protocol):
+    """Bounded connection whose idempotent close honors its timeout.
+
+    A successful send call means the record was admitted locally. If a send call
+    raises, the record was not admitted and may be attempted on a successor
+    association. Closing discards every admitted record that was not written.
+    """
+
     @property
     def association_uid(self) -> UUID: ...
 
@@ -208,7 +215,19 @@ class TransportListener(Protocol):
 
 
 @runtime_checkable
+class TransportListenerFailureSource(Protocol):
+    """Optional listener capability that reports its first terminal failure."""
+
+    def set_failure_callback(
+        self,
+        callback: Callable[[BaseException], None],
+    ) -> None: ...
+
+
+@runtime_checkable
 class Transport(Protocol):
+    """Weak-referenceable backend with idempotent, timeout-bounded shutdown."""
+
     def listen(
         self,
         endpoint: Endpoint,
@@ -242,6 +261,7 @@ __all__ = [
     "TransportLimits",
     "TransportListenError",
     "TransportListener",
+    "TransportListenerFailureSource",
     "TransportProtocolError",
     "TransportRecord",
 ]

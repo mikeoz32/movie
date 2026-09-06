@@ -28,6 +28,7 @@ from movie.remoting import (
     SerializerDescriptor,
     SerializerRegistry,
     SerializerRegistryBuilder,
+    TcpTransport,
     TransportLimits,
 )
 
@@ -347,13 +348,19 @@ def remoting_config(
     peer_endpoint: Endpoint,
     messages: int,
     payload_bytes: int,
-    transport_backend: str = "tcp",
+    backend: str = "asyncio",
 ) -> RemotingConfig:
+    if backend == "tcp":
+        transport = TcpTransport()
+    elif backend == "asyncio":
+        transport = None
+    else:
+        raise ValueError(f"unsupported remoting benchmark backend: {backend}")
     return RemotingConfig(
         local_endpoint,
         {peer_system_name: peer_endpoint},
         serializer_registry(),
-        transport_backend=transport_backend,
+        transport=transport,
         limits=remoting_limits(messages, payload_bytes),
         association_timeout=STARTUP_TIMEOUT_SECONDS,
     )
@@ -367,7 +374,7 @@ def same_process_once(
     messages: int,
     payload_bytes: int,
     workers: int,
-    transport_backend: str,
+    backend: str,
 ) -> dict[str, Any]:
     sender_name = "benchmark-same-process-sender"
     receiver_name = "benchmark-same-process-receiver"
@@ -386,7 +393,7 @@ def same_process_once(
             sender_endpoint,
             messages,
             payload_bytes,
-            transport_backend,
+            backend,
         ),
     )
     sender = None
@@ -402,7 +409,7 @@ def same_process_once(
                 receiver_endpoint,
                 messages,
                 payload_bytes,
-                transport_backend,
+                backend,
             ),
         )
         sender.remoting.associate(receiver_name, timeout=STARTUP_TIMEOUT_SECONDS)
@@ -459,7 +466,7 @@ def two_process_receiver_main(
     messages: int,
     payload_bytes: int,
     workers: int,
-    transport_backend: str,
+    backend: str,
 ) -> None:
     receiver_name = "benchmark-two-process-receiver"
     sender_name = "benchmark-two-process-sender"
@@ -478,7 +485,7 @@ def two_process_receiver_main(
                 Endpoint(sender_host, sender_port),
                 messages,
                 payload_bytes,
-                transport_backend,
+                backend,
             ),
         )
         endpoint = receiver.remoting.endpoint
@@ -692,7 +699,7 @@ def two_process_once(
     messages: int,
     payload_bytes: int,
     workers: int,
-    transport_backend: str,
+    backend: str,
 ) -> dict[str, Any]:
     verify_cross_process_clock()
     sender_name = "benchmark-two-process-sender"
@@ -719,7 +726,7 @@ def two_process_once(
                 messages,
                 payload_bytes,
                 workers,
-                transport_backend,
+                backend,
             ),
             name="movie-benchmark-receiver-process",
         )
@@ -746,7 +753,7 @@ def two_process_once(
                 receiver_endpoint,
                 messages,
                 payload_bytes,
-                transport_backend,
+                backend,
             ),
         )
         sender.remoting.associate(receiver_name, timeout=STARTUP_TIMEOUT_SECONDS)

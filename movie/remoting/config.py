@@ -12,7 +12,7 @@ from types import MappingProxyType
 from movie.remoting.errors import ProtocolValidationError
 from movie.remoting.serialization import SerializerRegistry
 from movie.remoting.transport import Endpoint, Transport, TransportLimits
-from movie.remoting.wire import MAX_U16
+from movie.remoting.wire import MAX_U16, MINIMUM_GOAWAY_FRAME_BYTES
 
 _REMOTE_NAME = re.compile(r"[A-Za-z0-9._~-]{1,255}\Z")
 _HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\Z")
@@ -70,7 +70,8 @@ class RemotingConfig:
     association_timeout: float = 5.0
     pending_association_limit: int = 64
     association_history_limit: int = 64
-    transport_backend: str = "tcp"
+    health_event_capacity: int = 1_000
+    health_event_max_subscriptions: int = 1_000
 
     def __post_init__(self) -> None:
         if not isinstance(self.local, Endpoint):
@@ -80,12 +81,6 @@ class RemotingConfig:
             raise ProtocolValidationError("serializers must be an immutable SerializerRegistry")
         if self.transport is not None and not isinstance(self.transport, Transport):
             raise ProtocolValidationError("transport must implement the Transport SPI")
-        if self.transport_backend not in ("tcp", "asyncio"):
-            raise ProtocolValidationError("transport backend must be 'tcp' or 'asyncio'")
-        if self.transport is not None and self.transport_backend != "tcp":
-            raise ProtocolValidationError(
-                "an explicit transport cannot be combined with another transport backend"
-            )
         if not isinstance(self.limits, TransportLimits):
             raise ProtocolValidationError("limits must be a TransportLimits value")
         if any(
@@ -99,7 +94,7 @@ class RemotingConfig:
             )
         ):
             raise ProtocolValidationError("all remoting limits must be positive")
-        if self.limits.maximum_record_bytes < 20:
+        if self.limits.maximum_record_bytes < MINIMUM_GOAWAY_FRAME_BYTES:
             raise ProtocolValidationError(
                 "maximum record bytes cannot encode the minimum GOAWAY frame"
             )
@@ -112,6 +107,11 @@ class RemotingConfig:
         for value, field_name in (
             (self.pending_association_limit, "pending association limit"),
             (self.association_history_limit, "association history limit"),
+            (self.health_event_capacity, "health event capacity"),
+            (
+                self.health_event_max_subscriptions,
+                "health event subscription limit",
+            ),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ProtocolValidationError(f"{field_name} must be positive")

@@ -184,8 +184,10 @@ def test_loopback_transport_exchanges_records_without_connection_threads(io_exte
         transport.close(timeout=1.0)
 
 
-def test_listener_rejects_a_non_multiplexed_preamble_before_handoff(io_extension) -> None:
+def test_listener_rejects_a_non_multiplexed_preamble_and_recovers(io_extension) -> None:
     transport, listener, accepted, raw = open_raw_peer(io_extension)
+    valid = None
+    server = None
     try:
         raw.sendall(
             encode_preamble(
@@ -197,8 +199,91 @@ def test_listener_rejects_a_non_multiplexed_preamble_before_handoff(io_extension
         assert raw.recv(1) == b""
         with pytest.raises(Empty):
             accepted.get_nowait()
+
+        valid = socket.create_connection(
+            (listener.endpoint.host, listener.endpoint.port),
+            timeout=1.0,
+        )
+        valid.sendall(multiplexed_preamble())
+        server = accepted.get(timeout=1.0)
+        frame = control_frame("after invalid preamble")
+        valid.sendall(frame)
+
+        assert server.receive(timeout=1.0) == TransportRecord(MULTIPLEXED, frame)
     finally:
         raw.close()
+        if valid is not None:
+            valid.close()
+        if server is not None:
+            server.close(timeout=1.0)
+        listener.close(timeout=1.0)
+        transport.close(timeout=1.0)
+
+
+def test_partial_preamble_timeout_releases_listener_capacity(
+    io_extension,
+    monkeypatch,
+) -> None:
+    preamble_started = threading.Event()
+    original_read_preamble = asyncio_tcp_module.AsyncioTcpListener._read_preamble
+
+    async def observe_read_preamble(listener, accepted_socket):
+        preamble_started.set()
+        return await original_read_preamble(listener, accepted_socket)
+
+    monkeypatch.setattr(
+        asyncio_tcp_module.AsyncioTcpListener,
+        "_read_preamble",
+        observe_read_preamble,
+    )
+    accepted: Queue = Queue()
+    transport = AsyncioTcpTransport(
+        io_extension,
+        handshake_workers=1,
+        accepted_socket_limit=1,
+        handshake_timeout=0.5,
+    )
+    listener = transport.listen(
+        Endpoint("127.0.0.1", 0),
+        limits(),
+        accepted.put,
+    )
+    partial = socket.create_connection(
+        (listener.endpoint.host, listener.endpoint.port),
+        timeout=1.0,
+    )
+    valid = None
+    server = None
+    try:
+        partial.sendall(multiplexed_preamble()[:-1])
+        assert preamble_started.wait(1.0)
+
+        valid = socket.create_connection(
+            (listener.endpoint.host, listener.endpoint.port),
+            timeout=1.0,
+        )
+        valid.sendall(multiplexed_preamble())
+
+        async def wait_for_accepted_capacity() -> None:
+            async with asyncio.timeout(0.25):
+                while not listener._accepted.full():
+                    await asyncio.sleep(0)
+
+        io_extension.run_coroutine(wait_for_accepted_capacity, timeout=1.0)
+        partial.settimeout(1.0)
+        assert partial.recv(1) == b""
+
+        server = accepted.get(timeout=1.0)
+        frame = control_frame("after preamble timeout")
+        valid.sendall(frame)
+        assert server.receive(timeout=1.0) == TransportRecord(MULTIPLEXED, frame)
+        assert not listener._closed
+    finally:
+        partial.close()
+        if valid is not None:
+            valid.close()
+        if server is not None:
+            server.close(timeout=1.0)
         listener.close(timeout=1.0)
         transport.close(timeout=1.0)
 
@@ -579,6 +664,36 @@ def test_transport_close_closes_live_listeners_and_connections(io_extension) -> 
     assert io_extension.run_coroutine(loop_is_running, timeout=1.0)
 
 
+def test_connection_created_after_transport_close_is_closed_on_its_owning_loop(
+    io_extension,
+    monkeypatch,
+) -> None:
+    transport = AsyncioTcpTransport(io_extension)
+    connection_socket, peer_socket = socket.socketpair()
+    connection_socket.setblocking(False)
+    peer_socket.settimeout(1.0)
+    monkeypatch.setattr(transport, "_track_connection", lambda connection: False)
+
+    async def reject_connection() -> None:
+        with pytest.raises(TransportClosedError):
+            transport._create_connection_on_loop(
+                connection_socket,
+                limits(),
+                ASSOCIATION_UID,
+            )
+        async with asyncio.timeout(1.0):
+            while connection_socket.fileno() != -1:
+                await asyncio.sleep(0.005)
+
+    try:
+        io_extension.run_coroutine(reject_connection, timeout=2.0)
+        assert peer_socket.recv(1) == b""
+    finally:
+        connection_socket.close()
+        peer_socket.close()
+        transport.close(timeout=1.0)
+
+
 def test_transport_close_converges_after_asyncio_extension_stops(io_extension) -> None:
     transport, listener, client, server = connect_pair(io_extension)
 
@@ -613,6 +728,89 @@ def test_transport_close_retry_retains_a_blocked_handoff(io_extension) -> None:
     finally:
         release.set()
         client.close(timeout=1.0)
+        transport.close(timeout=1.0)
+
+
+def test_failed_handoff_does_not_retry_connection_close_forever(io_extension) -> None:
+    attempts: Queue[float | None] = Queue()
+    allow_close = threading.Event()
+
+    def reject_handoff(connection) -> None:
+        original_close = connection.close
+
+        def controlled_close(timeout=None) -> None:
+            attempts.put(timeout)
+            if not allow_close.is_set():
+                raise TimeoutError("deliberate handoff close timeout")
+            original_close(timeout)
+
+        connection.close = controlled_close
+        raise RuntimeError("deliberate handoff rejection")
+
+    transport = AsyncioTcpTransport(io_extension, close_timeout=1.0)
+    listener = transport.listen(Endpoint("127.0.0.1", 0), limits(), reject_handoff)
+    client = transport.connect(listener.endpoint, limits(), ASSOCIATION_UID)
+    try:
+        assert attempts.get(timeout=1.0) == pytest.approx(0.05)
+        with pytest.raises(Empty):
+            attempts.get(timeout=0.1)
+    finally:
+        allow_close.set()
+        client.close(timeout=1.0)
+        transport.close(timeout=1.0)
+
+
+def test_unexpected_accept_failure_is_reported(io_extension, monkeypatch) -> None:
+    async def current_loop():
+        return asyncio.get_running_loop()
+
+    async def fail_accept(_socket):
+        raise RuntimeError("deliberate accept task failure")
+
+    loop = io_extension.run_coroutine(current_loop, timeout=1.0)
+    monkeypatch.setattr(loop, "sock_accept", fail_accept)
+    transport = AsyncioTcpTransport(io_extension)
+    listener = transport.listen(Endpoint("127.0.0.1", 0), limits(), lambda _: None)
+    failures: Queue[BaseException] = Queue()
+    try:
+        listener.set_failure_callback(failures.put)
+
+        failure = failures.get(timeout=1.0)
+        assert isinstance(failure, TransportListenError)
+        assert "deliberate accept task failure" in str(failure)
+        assert isinstance(failure.__cause__, RuntimeError)
+    finally:
+        transport.close(timeout=1.0)
+
+
+@pytest.mark.parametrize(
+    ("task_name", "detail"),
+    [
+        ("accept", "accept task was cancelled"),
+        ("handshake", "handshake task was cancelled"),
+    ],
+)
+def test_unexpected_listener_task_cancellation_is_reported(
+    io_extension,
+    task_name,
+    detail,
+) -> None:
+    transport = AsyncioTcpTransport(io_extension)
+    listener = transport.listen(Endpoint("127.0.0.1", 0), limits(), lambda _: None)
+    failures: Queue[BaseException] = Queue()
+    listener.set_failure_callback(failures.put)
+    task = (
+        listener._accept_task
+        if task_name == "accept"
+        else listener._handshake_tasks[0]
+    )
+    try:
+        listener._loop.call_soon_threadsafe(task.cancel)
+
+        failure = failures.get(timeout=1.0)
+        assert isinstance(failure, TransportListenError)
+        assert detail in str(failure)
+    finally:
         transport.close(timeout=1.0)
 
 

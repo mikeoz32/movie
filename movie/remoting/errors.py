@@ -81,5 +81,9 @@ class UnsupportedFeatureError(WireCodecError):
     """Mandatory flags or a header version are unsupported."""
 
 
+class UnsupportedHeaderVersionError(UnsupportedFeatureError):
+    """A frame uses an incompatible common-header version."""
+
+
 class WrongStreamError(WireCodecError):
     """A frame appeared on a stream kind on which it is not valid."""

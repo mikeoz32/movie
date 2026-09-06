@@ -1,5 +1,6 @@
 import struct
 from dataclasses import replace
+from random import Random
 from uuid import UUID
 
 import pytest
@@ -32,6 +33,7 @@ from movie.remoting import (
     UnsupportedFeatureError,
     UnsupportedFrameError,
     UserMessage,
+    WireCodecError,
     WrongStreamError,
     decode_common_header,
     decode_frame,
@@ -123,6 +125,68 @@ def all_frames():
     ]
 
 
+@pytest.mark.parametrize("seed", [0x4D4F5631, 0xA55A5AA5])
+def test_bounded_random_wire_inputs_have_typed_failures_and_canonical_successes(
+    seed,
+) -> None:
+    random = Random(seed)
+    frames = all_frames()
+    preambles = (
+        StreamPreamble(StreamKind.CONTROL, ASSOCIATION_UID, CONTROL_LANE_ID),
+        StreamPreamble(StreamKind.MULTIPLEXED, ASSOCIATION_UID, CONTROL_LANE_ID),
+        StreamPreamble(StreamKind.DELIVERY_LANE, ASSOCIATION_UID, 2),
+    )
+    decoded_frames = 0
+    rejected_frames = 0
+    decoded_preambles = 0
+    rejected_preambles = 0
+    for iteration in range(1_000):
+        if iteration % 2:
+            payload = bytearray(
+                encode_frame(
+                    random.choice(frames),
+                    stream_kind=StreamKind.MULTIPLEXED,
+                )
+            )
+            for _ in range(random.randrange(4)):
+                index = random.randrange(len(payload))
+                payload[index] ^= random.randrange(1, 256)
+            payload = bytes(payload)
+        else:
+            payload = random.randbytes(random.randrange(0, 513))
+        try:
+            frame = decode_frame(payload, stream_kind=StreamKind.MULTIPLEXED)
+        except WireCodecError:
+            rejected_frames += 1
+        else:
+            decoded_frames += 1
+            canonical = encode_frame(frame, stream_kind=StreamKind.MULTIPLEXED)
+            assert (
+                decode_frame(canonical, stream_kind=StreamKind.MULTIPLEXED)
+                == frame
+            )
+
+        if iteration % 2:
+            preamble_payload = bytearray(encode_preamble(random.choice(preambles)))
+            for _ in range(random.randrange(3)):
+                index = random.randrange(len(preamble_payload))
+                preamble_payload[index] ^= random.randrange(1, 256)
+            preamble_payload = bytes(preamble_payload)
+        else:
+            preamble_payload = random.randbytes(random.randrange(0, 48))
+        try:
+            preamble = decode_preamble(preamble_payload)
+        except WireCodecError:
+            rejected_preambles += 1
+        else:
+            decoded_preambles += 1
+            assert decode_preamble(encode_preamble(preamble)) == preamble
+    assert decoded_frames > 0
+    assert rejected_frames > 0
+    assert decoded_preambles > 0
+    assert rejected_preambles > 0
+
+
 def stream_for(frame):
     return StreamKind.DELIVERY_LANE if isinstance(frame, UserMessage) else StreamKind.CONTROL
 
@@ -209,6 +273,35 @@ def test_user_message_has_golden_big_endian_bytes():
         "00000007 0007 00000002 636861742f7632 7b7d"
     )
     assert decode_frame(encoded, stream_kind=StreamKind.DELIVERY_LANE) == message
+
+
+@pytest.mark.parametrize(
+    ("frame", "fixture"),
+    [
+        (
+            all_frames()[0],
+            "000000af0100000100000000000000000001000000000c6d6f7669652d73797374656d"
+            "102132435465768798a9bacbdcedfe0f00112233445566778899aabbccddeeff00096c6f"
+            "63616c686f73741f570001000000040000006400000000000f4240000000c800000000"
+            "001e8480000100000007000e6a736f6e2d636f6e747261637473000100020002000763"
+            "6861742f76310007636861742f763200010007636861742f7632000100087472616365"
+            "2f7631",
+        ),
+        (
+            all_frames()[1],
+            "0000006902000001000000000000000000112233445566778899aabbccddeeff00000001"
+            "000000040000006400000000000f4240000000c800000000001e848000011021324354"
+            "65768798a9bacbdcedfe0f0000000700010007636861742f76320001000874726163652f"
+            "7631",
+        ),
+    ],
+    ids=("hello-v1", "hello-accept-v1"),
+)
+def test_handshake_frames_match_v1_compatibility_fixtures(frame, fixture):
+    payload = bytes.fromhex(fixture)
+
+    assert encode_frame(frame, stream_kind=StreamKind.CONTROL) == payload
+    assert decode_frame(payload, stream_kind=StreamKind.CONTROL) == frame
 
 
 @pytest.mark.parametrize("length", [0, 22, 24])

@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import Callable, Coroutine
 from queue import Empty, Full, Queue
 from threading import Condition, Event, Lock, Thread, current_thread
-from time import monotonic, sleep
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
@@ -50,6 +50,7 @@ from movie.remoting.wire import (
 _RECEIVE_CHUNK_BYTES = 64 * 1024
 _WRITE_BATCH_BYTES = 256 * 1024
 _WRITE_BATCH_RECORDS = 64
+_HANDOFF_CLOSE_ATTEMPT_SECONDS = 0.05
 
 
 class _ConnectionStopped(Exception):
@@ -934,11 +935,14 @@ class AsyncioTcpListener:
         self._handoff: Queue[AsyncioTcpConnection] = Queue(maxsize=accepted_socket_limit)
         self._handoff_stopping = Event()
         self._state_lock = Lock()
+        self._handoff_deadline: float | None = None
         self._closed = False
         self._unregistered = False
         self._cleanup_started = False
         self._cleanup_complete = Event()
         self._cleanup_complete_on_loop = asyncio.Event()
+        self._failure: TransportListenError | None = None
+        self._failure_callback: Callable[[BaseException], None] | None = None
         self._handoff_thread = Thread(
             target=self._handoff_loop,
             name=f"movie-asyncio-tcp-listener-{endpoint.port}-handoff",
@@ -976,7 +980,8 @@ class AsyncioTcpListener:
                 "Asyncio TCP listener cannot synchronously close on the I/O loop"
             )
         deadline = _deadline(close_timeout)
-        self._request_handoff_stop()
+        self._request_handoff_stop(deadline)
+        self._mark_closed()
         if self._claim_cleanup():
             try:
                 self._extension.run_coroutine(
@@ -1008,7 +1013,44 @@ class AsyncioTcpListener:
         self._join_handoff(_remaining(deadline))
         self._finish_registration()
 
-    def _request_handoff_stop(self) -> None:
+    def set_failure_callback(
+        self,
+        callback: Callable[[BaseException], None],
+    ) -> None:
+        if not callable(callback):
+            raise TransportProtocolError("listener failure callback must be callable")
+        with self._state_lock:
+            self._failure_callback = callback
+            failure = self._failure
+        if failure is not None:
+            callback(failure)
+
+    def _record_failure(self, error: BaseException) -> None:
+        failure = TransportListenError(
+            f"Asyncio TCP listener failed at {self._endpoint}: {error}"
+        )
+        failure.__cause__ = error
+        with self._state_lock:
+            if self._closed or self._failure is not None:
+                return
+            self._failure = failure
+            callback = self._failure_callback
+        if callback is not None:
+            try:
+                callback(failure)
+            except BaseException:
+                pass
+
+    def _request_handoff_stop(self, deadline: float | None = None) -> None:
+        if deadline is not None:
+            with self._state_lock:
+                if (
+                    self._handoff_deadline is None
+                    or self._handoff_deadline <= monotonic()
+                ):
+                    self._handoff_deadline = deadline
+                else:
+                    self._handoff_deadline = min(self._handoff_deadline, deadline)
         self._handoff_stopping.set()
 
     def _join_handoff(self, timeout: float | None) -> None:
@@ -1146,8 +1188,16 @@ class AsyncioTcpListener:
                 except (OSError, asyncio.QueueFull):
                     _close_socket(accepted)
         except asyncio.CancelledError:
+            with self._state_lock:
+                closing = self._closed
+            if not closing:
+                self._record_failure(
+                    RuntimeError("Asyncio TCP listener accept task was cancelled")
+                )
+                await self._close_from_loop()
             raise
-        except OSError:
+        except BaseException as error:
+            self._record_failure(error)
             await self._close_from_loop()
 
     async def _handshake_loop(self) -> None:
@@ -1186,8 +1236,16 @@ class AsyncioTcpListener:
                 finally:
                     self._active_sockets.discard(accepted)
         except asyncio.CancelledError:
+            with self._state_lock:
+                closing = self._closed
+            if not closing:
+                self._record_failure(
+                    RuntimeError("Asyncio TCP listener handshake task was cancelled")
+                )
+                await self._close_from_loop()
             raise
-        except BaseException:
+        except BaseException as error:
+            self._record_failure(error)
             await self._close_from_loop()
 
     async def _read_preamble(self, accepted: socket.socket) -> StreamPreamble:
@@ -1222,17 +1280,22 @@ class AsyncioTcpListener:
                 self._close_handoff_connection(connection)
 
     def _close_handoff_connection(self, connection: AsyncioTcpConnection) -> None:
-        while True:
-            try:
-                connection.close(timeout=self._close_timeout)
-            except (TransportCapacityError, TransportClosedError, TimeoutError):
-                sleep(0.05)
-            else:
+        with self._state_lock:
+            deadline = self._handoff_deadline
+        close_timeout = min(self._close_timeout, _HANDOFF_CLOSE_ATTEMPT_SECONDS)
+        if deadline is not None:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
                 return
+            close_timeout = min(close_timeout, remaining)
+        try:
+            connection.close(timeout=close_timeout)
+        except (TransportCapacityError, TransportClosedError, TimeoutError):
+            pass
 
 
 class AsyncioTcpTransport:
-    """Opt-in raw-socket TCP transport using an actor system's asyncio extension."""
+    """Raw-socket TCP transport using an actor system's asyncio extension."""
 
     def __init__(
         self,
@@ -1344,7 +1407,7 @@ class AsyncioTcpTransport:
             if cleanup_owner:
                 self._cleanup_started = True
         for listener in listeners:
-            listener._request_handoff_stop()
+            listener._request_handoff_stop(deadline)
         if cleanup_owner:
             try:
                 self._extension.run_coroutine(
@@ -1514,7 +1577,7 @@ class AsyncioTcpTransport:
             on_close=self._forget_connection,
         )
         if not self._track_connection(connection):
-            self._loop.create_task(
+            asyncio.get_running_loop().create_task(
                 connection._close_from_loop(
                     TransportClosedError("Asyncio TCP transport is closed")
                 )

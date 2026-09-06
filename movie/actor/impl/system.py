@@ -494,7 +494,7 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
                     )
                 else:
                     try:
-                        self._remoting.stop(remaining)
+                        self._remoting._stop_before(deadline)
                     except BaseException as error:
                         shutdown_error = error
             guardian = self._actor_registry.root_guardian

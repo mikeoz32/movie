@@ -51,3 +51,11 @@ _Avoid_: Python class name, pickle type
 **Dead Letter**:
 A delivery attempt that the runtime knows cannot reach its intended actor identity.
 _Avoid_: Failed message, retry
+
+**Remoting Health Event**:
+A volatile local notification that a remoting listener failed or an association became active or closed. The bounded event window is diagnostic, not durable lifecycle delivery.
+_Avoid_: Cluster event, delivery acknowledgement
+
+**Remoting Metrics Snapshot**:
+An immutable view of cumulative remoting counters for one actor system incarnation. It does not imply remote receipt or actor processing.
+_Avoid_: Delivery confirmation, durable metric

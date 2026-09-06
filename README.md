@@ -62,7 +62,7 @@ Returning `Behaviors.stopped` from a behavior runs `PostStop`, terminates childr
 
 ## Remoting Example
 
-Remoting is disabled unless an immutable `RemotingConfig` is supplied. Every payload serializer and exact message-type binding must be registered explicitly; Movie never adds `pickle` or another implicit serializer.
+Remoting is disabled unless an immutable `RemotingConfig` is supplied. Its production TCP Transport Backend is `AsyncioTcpTransport`, running on the Actor System-owned asyncio I/O pool. Every payload serializer and exact message-type binding must be registered explicitly; Movie never adds `pickle` or another implicit serializer.
 
 ```python
 from dataclasses import dataclass
@@ -128,6 +128,10 @@ gateway.stop()
 ```
 
 `tell()` serializes synchronously and only confirms bounded local association admission. It does not confirm network receipt, mailbox admission, or actor processing. A disconnected `tell()` never reconnects or buffers; call `associate()` explicitly. TCP remoting is unencrypted and unauthenticated, so expose it only on a trusted network or through an authenticated encrypted tunnel.
+
+Use `system.remoting.is_healthy` as the listener readiness signal and inspect `system.remoting.failure` for the first terminal listener error. `system.remoting.metrics` retains cumulative delivery-attempt counters across reconnects, while `system.remoting.associations` exposes current queue gauges and negotiated limits. A failed production listener closes its associations and makes subsequent remoting operations reject deterministically; it does not stop local actors or restart the Actor System.
+
+Subscribe through `system.remoting.health_events.subscribe()` for a bounded stream of association activation, association closure, and listener failure events. Polling never blocks remoting. If a slow subscriber's `dropped_count` increases, resynchronize from the runtime properties above. `RemotingConfig.health_event_capacity` and `health_event_max_subscriptions` bound retained events and live subscriptions.
 
 In canonical `HELLO_ACCEPT`, `outbound_*` is the effective initiator-to-responder direction and `inbound_*` is responder-to-initiator. A responder therefore uses the wire `inbound_*` fields as its own send limits.
 
@@ -221,11 +225,11 @@ uv run python -m benchmarks.runtime \
 
 The suite measures single-actor throughput and sampled queue latency, concurrent-producer throughput and ordering, stream throughput, and actor-tree shutdown. Every workload verifies exact delivery or registry cleanup.
 
-Compare the three messaging layers with the same message count, payload, ordering checks, and sampled end-to-end latency:
+Compare local delivery with the production asyncio TCP remoting paths using the same message count, payload, ordering checks, and sampled end-to-end latency:
 
 ```console
 uv run python -m benchmarks.remoting \
-  --modes local_actor,same_process_tcp,two_process_tcp \
+  --modes local_actor,same_process_asyncio,two_process_asyncio \
   --messages 100000 \
   --payload 64 \
   --workers 4 \
@@ -234,7 +238,7 @@ uv run python -m benchmarks.remoting \
   --output remoting-benchmark.json
 ```
 
-`local_actor` runs a sender loop against the root actor of one actor system. `same_process_tcp` uses two actor systems in one process with a real loopback TCP association. `two_process_tcp` keeps the sender actor system in the parent process and runs the receiver actor system in a spawned child process over loopback TCP. The TCP summaries report actor-system, association, and remote-reference setup separately from throughput, and every summary includes a throughput ratio relative to `local_actor` when that mode is selected. The child reports its bounded latency sample set through a multiprocessing pipe; CPython's system-wide `perf_counter_ns` clock is checked during the readiness handshake. Configurations requiring more than 2 GiB of benchmark queue capacity are rejected.
+`local_actor` runs a sender loop against the root actor of one actor system. `same_process_asyncio` uses two actor systems in one process with real loopback associations over the production backend. `two_process_asyncio` keeps the sender actor system in the parent process and runs the receiver actor system in a spawned child process. The legacy `same_process_tcp` and `two_process_tcp` modes remain available for comparison through an explicitly injected threaded transport. Remote summaries report aggregate setup time separately from throughput, and every summary includes a throughput ratio relative to `local_actor` when that mode is selected. The child reports its bounded latency sample set through a multiprocessing pipe; CPython's system-wide `perf_counter_ns` clock is checked during the readiness handshake. Configurations requiring more than 2 GiB of benchmark queue capacity are rejected.
 
 Benchmark the Flow-based HTTP/1.1 server with persistent connections and a continuously replenished request pipeline:
 

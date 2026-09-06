@@ -1,6 +1,6 @@
 # Remoting v1 Contract
 
-Status: implemented.
+Status: implemented for trusted-network deployments.
 
 This document defines the interoperability and runtime semantics for Movie remoting v1. Canonical domain terms are defined in [`CONTEXT.md`](../CONTEXT.md), and the architectural boundary is recorded in [ADR-0001](adr/0001-remoting-v1-boundaries.md).
 
@@ -68,6 +68,8 @@ The initiator chooses a nonzero random 128-bit association UID, opens one transp
 
 If both peers initiate concurrently, both retain the connection with the lexicographically smaller `(initiator-incarnation-uid, association-uid)` tuple and close the other with `DUPLICATE_ASSOCIATION`.
 
+A candidate claiming a different peer incarnation never replaces a currently active association. The active association must first enter `CLOSING` or `CLOSED`; the caller can then explicitly associate the new incarnation. Incarnation UIDs are identities, not chronological version numbers, so their byte ordering cannot establish freshness.
+
 An association ends on graceful `GOAWAY`, transport connection loss, protocol violation, incompatible negotiation, or actor-system shutdown. Reconnecting creates a new association UID, new delivery lanes, and new ordering boundaries. Frames from a previous association are never replayed into its successor.
 
 ## Transport Mapping
@@ -77,9 +79,9 @@ The association layer exchanges complete bounded records on logical channels:
 - one bidirectional control channel;
 - a negotiated fixed number of unidirectional delivery lanes in each direction.
 
-The transport interface accepts control and delivery-lane records only after local queue admission. It must preserve record boundaries and ordering within each logical channel, provide bounded pending-message and pending-byte capacity, reject new records without evicting accepted records when full, and report connection closure without replaying records. Before negotiated limits are activated, a stream-multiplexed transport exposes only control records to the association and leaves delivery streams flow-controlled and unread. Activation occurs only after both `HELLO_ACCEPT` frames are validated, preventing a delivery stream from overtaking the handshake.
+The transport interface accepts control and delivery-lane records only after local queue admission. A successful send call means local admission; if it raises, the record was not admitted and can be attempted on a successor association. It must preserve record boundaries and ordering within each logical channel, provide bounded pending-message and pending-byte capacity, reject new records without evicting accepted records when full, discard unwritten admitted records on close, and report connection closure without replaying records. Before negotiated limits are activated, a stream-multiplexed transport exposes only control records to the association and leaves delivery streams flow-controlled and unread. Activation occurs only after both `HELLO_ACCEPT` frames are validated, preventing a delivery stream from overtaking the handshake.
 
-TCP is the required v1 backend. It uses one full-duplex ordered byte stream per association. The initiator writes this preamble once before the first frame:
+TCP is the required v1 backend. The production implementation is `AsyncioTcpTransport`, which runs socket tasks on the owning Actor System's `AsyncioIOExtension`. It uses one full-duplex ordered byte stream per association. The initiator writes this preamble once before the first frame:
 
 | Field | Size | Meaning |
 | --- | ---: | --- |
@@ -112,9 +114,9 @@ Every frame begins with:
 | Header version | 2 bytes | Version of this frame header |
 | Correlation ID | 8 bytes | Request/response correlation, or zero |
 
-Flags are zero in v1. Header version is one. Nonzero flags or another header version are unsupported mandatory features and close the association.
+Flags are zero in v1. Header version is one. Nonzero flags are protocol violations. Another header version is an incompatible protocol version and rejects a handshake with `INCOMPATIBLE_VERSION`.
 
-The negotiated maximum frame size includes the complete frame. Before negotiation, `HELLO`, `HELLO_ACCEPT`, and `HELLO_REJECT` use the 1 MiB bootstrap limit. A peer must reject an oversized frame before allocating its declared body.
+The negotiated maximum frame size includes the complete frame and must be at least 20 bytes, the size of an empty-detail `GOAWAY`. Before negotiation, `HELLO`, `HELLO_ACCEPT`, and `HELLO_REJECT` use the 1 MiB bootstrap limit. A peer must reject an oversized frame before allocating its declared body.
 
 Frame types reserved by v1 are:
 
@@ -294,7 +296,7 @@ Every association has bounded limits for:
 
 The transport reserves one additional control record and at most one maximum-frame worth of bytes for terminal `GOAWAY`. Normal control and user records cannot consume this reserve. Closing an association never evicts an accepted user record merely to report diagnostics; if the transport cannot flush the reserve within the shutdown deadline, it closes without replay.
 
-TCP socket backpressure does not replace runtime queue limits. A full outbound lane rejects `tell` synchronously with a remoting capacity error. It must not evict an older accepted envelope. The transport writer blocks only its dedicated I/O thread, never an actor dispatcher worker.
+TCP socket backpressure does not replace runtime queue limits. A full outbound lane rejects `tell` synchronously with a remoting capacity error. It must not evict an older accepted envelope. Production socket I/O runs only on the bounded asyncio I/O pool, never on an actor dispatcher worker; the explicitly injected legacy transport instead owns dedicated I/O threads.
 
 A peer that exceeds negotiated frame or inbound limits receives `GOAWAY` with `FLOW_CONTROL_VIOLATION`, and the association closes.
 
@@ -334,7 +336,12 @@ An implementation must expose, at minimum:
 - accepted, rejected, and dead-letter delivery-attempt counts;
 - serialization and deserialization rejection counts;
 - per-lane sequence violations;
-- reconnect count without implying message retry.
+- reconnect count without implying message retry;
+- listener health and the first retained terminal listener failure.
+
+`RemotingRuntime.metrics` is an immutable cumulative snapshot scoped to one Actor System Incarnation. Its counters start at zero, survive reconnects and bounded association-history eviction, and never imply remote processing. Accepted attempts count successful local outbound association admission or successful inbound mailbox admission. Rejected attempts include serialization, capacity, deserialization, mailbox, stale-incarnation, and no-association rejection at the runtime where each rejection is observed. Reconnect count increments once for each newly active association to the same peer incarnation after its predecessor closes. Association snapshots additionally expose current queue gauges, the negotiated maximum frame size, and immutable per-lane sequence-violation counts.
+
+`RemotingRuntime.health_events` is a bounded local event window for `ASSOCIATION_ACTIVATED`, `ASSOCIATION_CLOSED`, and `LISTENER_FAILED`. A subscription observes only later publications, never backpressures remoting, and reports overwritten entries through its cumulative `dropped_count`; after a drop, consumers resynchronize from `is_healthy`, `failure`, `associations`, and `metrics`. Successful runtime shutdown closes the stream after final association events are published. Existing subscriptions may drain retained events after closure, but new subscriptions are rejected. Health events are volatile diagnostics, not durable lifecycle delivery.
 
 ## Runtime Foundations
 
@@ -347,7 +354,8 @@ The implementation provides these local foundations:
 - the actor system exposes bounded dead-letter subscriptions;
 - serializer registries are immutable while an association is active;
 - a remote actor reference cannot be used as a parent or receive local lifecycle system messages.
+- a production listener's terminal failure makes remoting unhealthy, closes its associations, and causes new remoting operations to reject with the retained failure; local actors continue until explicit Actor System shutdown.
 
 Tracing capability names, a TLS transport option, and an optional QUIC backend can be added later without changing this wire or delivery contract.
 
-`RemotingConfig` owns its transport object for exactly one actor-system incarnation. A transport must not be shared between actor systems. Actor-system shutdown closes the listener, associations, pending connections, resolver workers, and finally the transport within the one global shutdown deadline.
+`RemotingConfig` owns its weak-referenceable transport object for exactly one actor-system incarnation. A transport must not be shared between actor systems or reused by a later incarnation. When no explicit transport is supplied, the runtime creates an `AsyncioTcpTransport`; the legacy threaded transport is not selected implicitly. Actor-system shutdown closes the listener, associations, pending connections, and finally the transport within the one global shutdown deadline. Transport close operations are idempotent and must honor the timeout supplied by the runtime. Internal cleanup retries stop at their local or Actor System shutdown deadline; a later explicit shutdown call may make a new bounded cleanup attempt. A connection that refuses to close remains runtime-owned and consumes bounded capacity until that attempt.

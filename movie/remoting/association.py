@@ -24,6 +24,7 @@ from movie.remoting.errors import (
     SerializerNegotiationError,
     UnknownSerializerError,
     UnsupportedFrameError,
+    UnsupportedHeaderVersionError,
     UnsupportedManifestError,
     WireCodecError,
 )
@@ -35,7 +36,6 @@ from movie.remoting.transport import (
     TransportCapacityError,
     TransportClosedError,
     TransportConnection,
-    TransportError,
     TransportFlowControlError,
     TransportLimits,
     TransportProtocolError,
@@ -43,9 +43,9 @@ from movie.remoting.transport import (
 )
 from movie.remoting.wire import (
     BOOTSTRAP_MAX_FRAME_BYTES,
-    COMMON_HEADER_SIZE,
     CONTROL_LANE_ID,
     MAX_U64,
+    MINIMUM_GOAWAY_FRAME_BYTES,
     PROTOCOL_MAJOR,
     PROTOCOL_MINOR,
     AssociationRole,
@@ -100,6 +100,8 @@ class AssociationSnapshot:
     peer_incarnation_uid: UUID | None
     peer_endpoint: Endpoint | None
     lane_count: int | None
+    maximum_frame_bytes: int | None
+    sequence_violations_by_lane: tuple[int, ...] | None
     outbound_message_limit: int | None
     outbound_byte_limit: int | None
     inbound_message_limit: int | None
@@ -176,6 +178,7 @@ class Association:
         self._serializer_minors: dict[int, int] = {}
         self._outbound_sequences: list[int] = []
         self._inbound_sequences: list[int] = []
+        self._sequence_violations_by_lane: list[int] = []
         self._deferred_records: deque[TransportRecord] = deque()
         self._deferred_bytes = 0
         self._pending: dict[int, _PendingResolve] = {}
@@ -189,9 +192,11 @@ class Association:
         self._deserialization_rejections = 0
         self._sequence_violations = 0
         self._reconnect_count = 0
+        self._counts_as_reconnect = False
         self._started = False
         self._closed_notified = False
         self._registration_order = 0
+        self._close_deadline: float | None = None
 
         direction = "outbound" if initiator else "inbound"
         self._thread = Thread(
@@ -230,11 +235,12 @@ class Association:
 
     @property
     def initiator_rank(self) -> tuple[bytes, bytes]:
+        if self._initiator:
+            return self._runtime.incarnation_uid.bytes, self.association_uid.bytes
         peer_uid = self.peer_incarnation_uid
         if peer_uid is None:
             raise RuntimeError("association rank is unavailable before HELLO")
-        initiator_uid = self._runtime.incarnation_uid if self._initiator else peer_uid
-        return initiator_uid.bytes, self.association_uid.bytes
+        return peer_uid.bytes, self.association_uid.bytes
 
     def start(self) -> None:
         with self._condition:
@@ -259,27 +265,39 @@ class Association:
 
     def close(self, timeout: float, *, detail: str = "actor system shutdown") -> None:
         deadline = monotonic() + timeout
+        with self._condition:
+            if self._close_deadline is None or self._close_deadline <= monotonic():
+                self._close_deadline = deadline
+            else:
+                self._close_deadline = min(self._close_deadline, deadline)
         self.request_close(ReasonCode.NORMAL_SHUTDOWN, detail)
         self._flush_outbound(min(deadline, monotonic() + 0.05))
-        self._connection.close(timeout=max(0.0, deadline - monotonic()))
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("association did not close before the deadline")
+        self._connection.close(timeout=remaining)
+        self._runtime._connection_closed(self._connection)
         if self._thread is not current_thread() and self._started:
             self._thread.join(max(0.0, deadline - monotonic()))
             if self._thread.is_alive():
                 raise TimeoutError("association thread did not stop before the deadline")
         self._mark_closed()
 
-    def request_close(self, reason: ReasonCode, detail: str) -> None:
+    def request_close(
+        self,
+        reason: ReasonCode,
+        detail: str,
+        *,
+        notify_peer: bool = True,
+    ) -> None:
         with self._condition:
             if self._state in (AssociationState.CLOSING, AssociationState.CLOSED):
                 return
-            was_handshaking = self._state is AssociationState.HANDSHAKING
-            self._state = AssociationState.CLOSING
             self._close_reason = reason
             self._close_detail = detail
-            if was_handshaking and self._handshake_error is None:
-                self._handshake_error = HandshakeError(detail)
-            self._condition.notify_all()
-        self._send_terminal_best_effort(GoAway(reason, detail))
+            self._transition_to_closing_locked(detail)
+        if notify_peer:
+            self._send_terminal_best_effort(GoAway(reason, detail))
         self._stop_requested.set()
 
     def send_user_message(self, recipient: ActorIdentity, message: object) -> None:
@@ -296,7 +314,7 @@ class Association:
                 self._serializer_minors[binding.serializer_id],
             )
         except Exception as error:
-            self._increment("serialization")
+            self._increment_many(serialization=1, rejected=1)
             raise error
 
         with self._send_lock:
@@ -326,11 +344,15 @@ class Association:
                 serialized.manifest,
                 serialized.payload,
             )
-            payload = encode_frame(
-                frame,
-                maximum_frame_bytes=self._maximum_frame_bytes,
-                stream_kind=StreamKind.DELIVERY_LANE,
-            )
+            try:
+                payload = encode_frame(
+                    frame,
+                    maximum_frame_bytes=self._maximum_frame_bytes,
+                    stream_kind=StreamKind.DELIVERY_LANE,
+                )
+            except FrameTooLargeError:
+                self._increment("rejected")
+                raise
             try:
                 peer_name = self._peer_system_name
                 assert peer_name is not None
@@ -346,7 +368,7 @@ class Association:
                 self._increment("rejected")
                 raise RemotingCapacityError("outbound association capacity is full") from error
             except TransportClosedError as error:
-                self._increment("rejected")
+                self._increment("rejected", cumulative=False)
                 raise NoAssociationError("association closed before admission") from error
             self._outbound_sequences[lane_id] = lane_sequence + 1
             self._increment("accepted")
@@ -388,6 +410,7 @@ class Association:
     def snapshot(self) -> AssociationSnapshot:
         transport = self._connection.snapshot()
         with self._condition:
+            accept = self._accept
             metrics = AssociationMetrics(
                 self._accepted_delivery_attempts,
                 self._rejected_delivery_attempts,
@@ -406,6 +429,12 @@ class Association:
                 self._peer_incarnation_uid,
                 self._peer_endpoint,
                 self._lane_count,
+                accept.maximum_frame_bytes if accept is not None else None,
+                (
+                    tuple(self._sequence_violations_by_lane)
+                    if accept is not None
+                    else None
+                ),
                 self._outbound_message_limit,
                 self._outbound_byte_limit,
                 self._inbound_message_limit,
@@ -435,7 +464,6 @@ class Association:
                 raise _HandshakeFailure(
                     ReasonCode.DUPLICATE_ASSOCIATION,
                     "a canonical duplicate association was retained",
-                    reply=False,
                 )
             with self._condition:
                 if self._state is not AssociationState.HANDSHAKING:
@@ -445,12 +473,18 @@ class Association:
             self._runtime._association_activated(self)
             self._active_loop()
         except _HandshakeFailure as failure:
-            with self._condition:
-                self._handshake_error = HandshakeError(failure.detail)
-            if failure.reason is ReasonCode.DUPLICATE_ASSOCIATION:
-                self._send_terminal_best_effort(GoAway(failure.reason, failure.detail))
-            elif failure.reply:
-                self._send_bootstrap_best_effort(HelloReject(failure.reason, failure.detail))
+            if failure.reply:
+                if (
+                    failure.reason is ReasonCode.DUPLICATE_ASSOCIATION
+                    and self._accept is not None
+                ):
+                    self._send_terminal_best_effort(
+                        GoAway(failure.reason, failure.detail)
+                    )
+                else:
+                    self._send_bootstrap_best_effort(
+                        HelloReject(failure.reason, failure.detail)
+                    )
             self._set_close_reason(failure.reason, failure.detail)
         except _ProtocolFailure as failure:
             self._send_terminal_best_effort(GoAway(failure.reason, failure.detail))
@@ -481,29 +515,53 @@ class Association:
             self._set_close_reason(ReasonCode.PROTOCOL_VIOLATION, str(error))
         finally:
             self._stop_requested.set()
+            with self._condition:
+                if self._close_deadline is None:
+                    self._close_deadline = (
+                        monotonic() + self._runtime.config.association_timeout
+                    )
             if self._close_reason is not None:
-                self._flush_outbound(
-                    monotonic() + min(0.05, self._runtime.config.association_timeout)
+                cleanup_deadline = self._cleanup_deadline()
+                flush_deadline = monotonic() + min(
+                    0.05,
+                    self._runtime.config.association_timeout,
                 )
-            try:
-                self._connection.close(timeout=self._runtime.config.association_timeout)
-            except (TimeoutError, TransportError):
-                with self._condition:
-                    if self._state is not AssociationState.CLOSED:
-                        self._state = AssociationState.CLOSING
-                        self._condition.notify_all()
-                while True:
-                    try:
-                        self._connection.close(
-                            timeout=self._runtime.config.association_timeout
-                        )
-                    except (TimeoutError, TransportError):
-                        sleep(0.05)
-                    else:
-                        self._mark_closed()
-                        break
+                flush_deadline = min(flush_deadline, cleanup_deadline)
+                self._flush_outbound(flush_deadline)
+            cleanup_deadline = self._cleanup_deadline()
+            remaining = cleanup_deadline - monotonic()
+            if remaining <= 0:
+                self._runtime._defer_connection_close(
+                    self._connection,
+                    cleanup_deadline,
+                )
+                close_timeout = None
             else:
-                self._mark_closed()
+                close_timeout = min(
+                    0.05,
+                    remaining,
+                    self._runtime.config.association_timeout,
+                )
+            if close_timeout is not None:
+                try:
+                    self._connection.close(timeout=close_timeout)
+                except BaseException:
+                    self._runtime._defer_connection_close(
+                        self._connection,
+                        cleanup_deadline,
+                    )
+                else:
+                    self._runtime._connection_closed(self._connection)
+            self._mark_closed()
+
+    def _cleanup_deadline(self) -> float:
+        runtime_deadline = self._runtime._association_cleanup_deadline()
+        with self._condition:
+            close_deadline = self._close_deadline
+        assert close_deadline is not None
+        if runtime_deadline is None:
+            return close_deadline
+        return min(runtime_deadline, close_deadline)
 
     def _handshake(self) -> None:
         deadline = monotonic() + self._handshake_timeout
@@ -511,10 +569,13 @@ class Association:
         local_hello = self._local_hello(role)
         if self._initiator:
             self._send_frame(local_hello, bootstrap=True, enforce_effective=False)
-            peer_hello = self._receive_hello(deadline)
-        else:
-            peer_hello = self._receive_hello(deadline)
+        peer_hello = self._receive_hello(deadline)
         self._validate_peer_hello(peer_hello, role)
+        if not self._runtime._retain_handshake_candidate(self):
+            raise _HandshakeFailure(
+                ReasonCode.DUPLICATE_ASSOCIATION,
+                "a canonical duplicate association was retained",
+            )
         if not self._initiator:
             self._send_frame(local_hello, bootstrap=True, enforce_effective=False)
 
@@ -597,6 +658,11 @@ class Association:
                     ReasonCode.UNSUPPORTED_FRAME,
                     str(error),
                 ) from error
+            except UnsupportedHeaderVersionError as error:
+                raise _HandshakeFailure(
+                    ReasonCode.INCOMPATIBLE_VERSION,
+                    str(error),
+                ) from error
             except WireCodecError as error:
                 raise _HandshakeFailure(ReasonCode.PROTOCOL_VIOLATION, str(error)) from error
             if defer_delivery and isinstance(frame, UserMessage):
@@ -639,9 +705,14 @@ class Association:
                 hello.inbound_message_limit,
                 hello.inbound_byte_limit,
             )
-        ) or hello.maximum_frame_bytes < COMMON_HEADER_SIZE:
+        ):
             raise _HandshakeFailure(
                 ReasonCode.PROTOCOL_VIOLATION, "peer HELLO limits must be positive"
+            )
+        if hello.maximum_frame_bytes < MINIMUM_GOAWAY_FRAME_BYTES:
+            raise _HandshakeFailure(
+                ReasonCode.PROTOCOL_VIOLATION,
+                "peer maximum frame bytes cannot encode the minimum GOAWAY frame",
             )
         try:
             endpoint = Endpoint(hello.endpoint_host, hello.endpoint_port)
@@ -728,6 +799,7 @@ class Association:
             }
             self._outbound_sequences = [0] * accept.lane_count
             self._inbound_sequences = [0] * accept.lane_count
+            self._sequence_violations_by_lane = [0] * accept.lane_count
 
     def _activate_transport(self, accept: HelloAccept) -> None:
         assert self._outbound_message_limit is not None
@@ -870,9 +942,19 @@ class Association:
             )
         pending.completed.set()
 
-    def _set_reconnect_count(self, reconnect_count: int) -> None:
+    def _set_reconnect_count(
+        self,
+        reconnect_count: int,
+        *,
+        counts_as_reconnect: bool,
+    ) -> None:
         with self._condition:
             self._reconnect_count = reconnect_count
+            self._counts_as_reconnect = counts_as_reconnect
+
+    def _is_reconnect(self) -> bool:
+        with self._condition:
+            return self._counts_as_reconnect
 
     def _set_registration_order(self, registration_order: int) -> None:
         self._registration_order = registration_order
@@ -901,7 +983,7 @@ class Association:
             )
         expected = self._inbound_sequences[frame.lane_id]
         if frame.lane_sequence != expected:
-            self._increment("sequence")
+            self._increment_sequence_violation(frame.lane_id)
             raise _ProtocolFailure(
                 ReasonCode.PROTOCOL_VIOLATION,
                 f"delivery lane {frame.lane_id} expected sequence {expected}, "
@@ -924,9 +1006,11 @@ class Association:
                 self._serializer_minors[frame.serializer_id],
             )
         except (UnknownSerializerError, UnsupportedManifestError, DeserializationError) as error:
-            self._increment("deserialization")
-            self._increment("rejected")
-            self._increment("dead_letter")
+            self._increment_many(
+                deserialization=1,
+                rejected=1,
+                dead_letter=1,
+            )
             self._runtime._publish_remoting_dead_letter(
                 identity,
                 DeadLetterReason.DESERIALIZATION_REJECTED,
@@ -1003,8 +1087,7 @@ class Association:
             if result is RemoteAdmissionResult.ACCEPTED:
                 accepted += 1
                 continue
-            self._increment("rejected")
-            self._increment("dead_letter")
+            self._increment_many(rejected=1, dead_letter=1)
             reason = {
                 RemoteAdmissionResult.ACTOR_NOT_FOUND: ReasonCode.ACTOR_NOT_FOUND,
                 RemoteAdmissionResult.ACTOR_STOPPING: ReasonCode.ACTOR_STOPPING,
@@ -1171,26 +1254,66 @@ class Association:
             raise NoAssociationError("association peer is unknown")
         return name
 
-    def _increment(self, counter: str, amount: int = 1) -> None:
+    def _increment(
+        self,
+        counter: str,
+        amount: int = 1,
+        *,
+        cumulative: bool = True,
+    ) -> None:
+        self._increment_many(cumulative=cumulative, **{counter: amount})
+
+    def _increment_sequence_violation(self, lane_id: int) -> None:
         with self._condition:
-            if counter == "accepted":
-                self._accepted_delivery_attempts += amount
-            elif counter == "rejected":
-                self._rejected_delivery_attempts += amount
-            elif counter == "dead_letter":
-                self._dead_letter_count += amount
-            elif counter == "serialization":
-                self._serialization_rejections += amount
-            elif counter == "deserialization":
-                self._deserialization_rejections += amount
-            elif counter == "sequence":
-                self._sequence_violations += amount
+            self._sequence_violations += 1
+            self._sequence_violations_by_lane[lane_id] += 1
+        self._runtime._record_metrics(sequence_violations=1)
+
+    def _increment_many(self, *, cumulative: bool = True, **increments: int) -> None:
+        with self._condition:
+            for counter, amount in increments.items():
+                if counter == "accepted":
+                    self._accepted_delivery_attempts += amount
+                elif counter == "rejected":
+                    self._rejected_delivery_attempts += amount
+                elif counter == "dead_letter":
+                    self._dead_letter_count += amount
+                elif counter == "serialization":
+                    self._serialization_rejections += amount
+                elif counter == "deserialization":
+                    self._deserialization_rejections += amount
+                elif counter == "sequence":
+                    self._sequence_violations += amount
+                else:
+                    raise ValueError(f"unknown association metric {counter!r}")
+        names = {
+            "accepted": "accepted_delivery_attempts",
+            "rejected": "rejected_delivery_attempts",
+            "dead_letter": "dead_letter_count",
+            "serialization": "serialization_rejections",
+            "deserialization": "deserialization_rejections",
+            "sequence": "sequence_violations",
+        }
+        if cumulative:
+            self._runtime._record_metrics(
+                **{names[counter]: amount for counter, amount in increments.items()}
+            )
 
     def _set_close_reason(self, reason: ReasonCode | None, detail: str) -> None:
         with self._condition:
             if self._close_detail is None:
                 self._close_reason = reason
                 self._close_detail = detail
+            if self._state is not AssociationState.CLOSED:
+                self._transition_to_closing_locked(detail)
+        self._stop_requested.set()
+
+    def _transition_to_closing_locked(self, detail: str) -> None:
+        was_handshaking = self._state is AssociationState.HANDSHAKING
+        self._state = AssociationState.CLOSING
+        if was_handshaking and self._handshake_error is None:
+            self._handshake_error = HandshakeError(detail)
+        self._condition.notify_all()
 
     def _mark_closed(self) -> None:
         with self._condition:
