@@ -1,7 +1,9 @@
+import math
 import os
 import queue
 import uuid
 from concurrent.futures import Future
+from dataclasses import replace
 from enum import Enum, auto
 from logging import Formatter, Logger, StreamHandler, handlers
 from pathlib import Path
@@ -34,12 +36,16 @@ from movie.actor.path import (
 )
 from movie.actor.ref import ActorRef
 from movie.actor.system import InternalActorSystem
+from movie.cluster._protocol import _augment_registry
+from movie.cluster.config import ClusterConfig
+from movie.cluster.extension import CLUSTER, ClusterExtension
+from movie.cluster.runtime import ClusterRuntime
 from movie.config import Config
 from movie.dispatch.manager import DispatcherManager
 from movie.future import CallbackExecutor
 from movie.mailbox.manager import MailboxManager
 from movie.remoting.config import RemotingConfig
-from movie.remoting.runtime import RemotingRuntime
+from movie.remoting.extension import REMOTING, RemotingExtension
 
 E = TypeVar("E", bound=Extension)
 
@@ -283,6 +289,7 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         *,
         config: Config | None = None,
         remoting: RemotingConfig | None = None,
+        cluster: ClusterConfig | None = None,
     ) -> None:
         self._name = name
         self._incarnation_uid = new_incarnation_uid()
@@ -312,7 +319,8 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
             raise ValueError("Actor shutdown timeout must be positive")
         if callback_workers is None or callback_workers <= 0:
             raise ValueError("Future callback worker count must be positive")
-        if max_actors is None or max_actors < 2:
+        minimum_actor_capacity = 3 if cluster is not None else 2
+        if max_actors is None or max_actors < minimum_actor_capacity:
             raise ValueError("Actor capacity must allow the guardian and root actor")
         if (
             dead_letter_capacity is None
@@ -350,7 +358,21 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         self._dead_letters: DeadLetterBroker[DeadLetter] = DeadLetterBroker(
             dead_letter_capacity, dead_letter_subscriptions
         )
-        self._remoting = RemotingRuntime(self, remoting) if remoting is not None else None
+        if cluster is not None:
+            if remoting is None:
+                raise ValueError("cluster membership requires remoting configuration")
+            remoting = replace(
+                remoting,
+                serializers=_augment_registry(
+                    remoting.serializers,
+                    cluster.serializer_id,
+                ),
+            )
+            ClusterRuntime._validate_configuration(self, cluster, remoting)
+        self._remoting_config = remoting
+        self._cluster_config = cluster
+        self._cluster_admission: ClusterExtension | None = None
+        self._cluster_admission_lock = Lock()
         self._lifecycle_lock = RLock()
         self._stop_lock = Lock()
         self._state = SystemState.NEW
@@ -358,6 +380,10 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         self._rollback_started = Event()
         self._callback_shutdown_started = Event()
         self._callback_state = local()
+        if self._remoting_config is not None:
+            self._extensions.configure(REMOTING)
+        if self._cluster_config is not None:
+            self._extensions.configure(CLUSTER)
         self._callbacks = CallbackExecutor(
             name,
             workers=callback_workers,
@@ -382,6 +408,28 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
 
     def extension(self, extension_id: ExtensionId[E]) -> E:
         return self._extensions.get(extension_id)
+
+    def _create_remoting_extension(self) -> RemotingExtension:
+        config = self._remoting_config
+        if config is None:
+            raise RuntimeError("remoting is not configured for this actor system")
+        return RemotingExtension(self, config)
+
+    def _create_cluster_extension(self) -> ClusterExtension:
+        config = self._cluster_config
+        remoting_config = self._remoting_config
+        if config is None or remoting_config is None:
+            raise RuntimeError("cluster membership is not configured for this actor system")
+        remoting = REMOTING.get(self)
+        extension = ClusterExtension(self, config, remoting_config, remoting)
+        with self._cluster_admission_lock:
+            self._cluster_admission = extension
+        return extension
+
+    def _clear_cluster_admission(self, extension: ClusterRuntime) -> None:
+        with self._cluster_admission_lock:
+            if self._cluster_admission is extension:
+                self._cluster_admission = None
 
     def setup_logger(self) -> None:
         self._actor_log = Logger(f"movie.actor.{self._name}")
@@ -422,8 +470,10 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
                 )
             if context.startup_error is not None:
                 raise RuntimeError("Root actor failed during startup") from context.startup_error
-            if self._remoting is not None:
-                self._remoting.start()
+            if self._remoting_config is not None:
+                REMOTING.get(self)
+            if self._cluster_config is not None:
+                CLUSTER.get(self)
         except BaseException as startup_error:
             try:
                 self._shutdown(self._configured_shutdown_timeout())
@@ -441,11 +491,16 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
             raise RuntimeError("Actor system startup was interrupted by shutdown")
 
     def stop(self, timeout: float | None = None) -> None:
-        if getattr(self._callback_state, "depth", 0) > 0:
+        if self._is_in_actor_callback():
             raise RuntimeError("ActorSystem.stop() cannot be called from an actor callback")
         if timeout is None:
             timeout = self._configured_shutdown_timeout()
-        elif timeout <= 0:
+        elif (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise ValueError("Actor shutdown timeout must be positive")
         self._shutdown(timeout)
 
@@ -485,21 +540,21 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
                 self._state = SystemState.STOPPING
             finally:
                 self._lifecycle_lock.release()
-            shutdown_error: BaseException | None = None
-            if self._remoting is not None:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    shutdown_error = TimeoutError(
-                        f"Actor system did not stop within {timeout} seconds"
-                    )
-                else:
-                    try:
-                        self._remoting._stop_before(deadline)
-                    except BaseException as error:
-                        shutdown_error = error
+            preparation_error: BaseException | None = None
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                preparation_error = TimeoutError(
+                    f"Actor system did not stop within {timeout} seconds"
+                )
+            else:
+                try:
+                    self._extensions.prepare_stop_all(remaining)
+                except BaseException as error:
+                    preparation_error = error
             guardian = self._actor_registry.root_guardian
             context = self.get_context(guardian) if guardian is not None else None
 
+            actor_shutdown_error: BaseException | None = None
             if guardian is not None and context is not None:
                 try:
                     while not context.is_stopped:
@@ -518,21 +573,27 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
                             f"Actor system did not stop within {timeout} seconds"
                         )
                 except BaseException as error:
-                    if shutdown_error is None:
-                        shutdown_error = error
-                    else:
-                        shutdown_error.add_note(
-                            f"Local actor shutdown also failed: {error!r}"
-                        )
-            if shutdown_error is not None:
-                raise shutdown_error
+                    actor_shutdown_error = error
+            if actor_shutdown_error is not None:
+                if preparation_error is not None:
+                    actor_shutdown_error.add_note(
+                        f"Extension shutdown preparation also failed: {preparation_error!r}"
+                    )
+                raise actor_shutdown_error
 
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise TimeoutError(
                     f"Actor system did not stop within {timeout} seconds"
                 )
-            self._extensions.stop_all(remaining)
+            try:
+                self._extensions.stop_all(remaining)
+            except BaseException as error:
+                if preparation_error is not None:
+                    error.add_note(
+                        f"Extension shutdown preparation also failed: {preparation_error!r}"
+                    )
+                raise
 
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -558,6 +619,8 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
             self._actor_registry.clear()
             if self._callbacks.owns_current_thread():
                 self._start_callback_shutdown_finalizer()
+                if preparation_error is not None:
+                    raise preparation_error
                 return
             remaining = deadline - monotonic()
             if remaining <= 0 or not self._lifecycle_lock.acquire(timeout=remaining):
@@ -569,6 +632,8 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
                 self._terminated.set()
             finally:
                 self._lifecycle_lock.release()
+            if preparation_error is not None:
+                raise preparation_error
         finally:
             self._stop_lock.release()
 
@@ -666,10 +731,23 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         self, identity: ActorIdentity, message: Any, **metadata: Any
     ) -> RemoteAdmissionResult:
         ref = self._actor_registry.resolve_identity(identity)
-        if ref is None:
-            result = RemoteAdmissionResult.ACTOR_NOT_FOUND
-        else:
-            result = ref.admit_remote_message(message)
+        with self._cluster_admission_lock:
+            cluster_admission = self._cluster_admission
+        result = (
+            cluster_admission._admit_remote_control(
+                identity,
+                message,
+                metadata.get("association_uid"),
+                ref.path.remote_path if ref is not None else None,
+            )
+            if cluster_admission is not None
+            else None
+        )
+        if result is None:
+            if ref is None:
+                result = RemoteAdmissionResult.ACTOR_NOT_FOUND
+            else:
+                result = ref.admit_remote_message(message)
         if result is not RemoteAdmissionResult.ACCEPTED:
             self._publish_dead_letter(
                 identity,
@@ -766,8 +844,12 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         return self._dead_letters
 
     @property
-    def remoting(self) -> RemotingRuntime | None:
-        return self._remoting
+    def remoting(self) -> RemotingExtension | None:
+        return self._extensions.find(REMOTING)
+
+    @property
+    def cluster(self) -> ClusterExtension | None:
+        return self._extensions.find(CLUSTER)
 
     @property
     def name(self) -> str:
@@ -778,6 +860,9 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
 
     def _exit_actor_callback(self) -> None:
         self._callback_state.depth -= 1
+
+    def _is_in_actor_callback(self) -> bool:
+        return getattr(self._callback_state, "depth", 0) > 0
 
     def _submit_callback(self, callback) -> None:
         self._callbacks.submit(callback)

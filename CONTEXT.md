@@ -1,6 +1,6 @@
 # Movie Actor Runtime
 
-Movie provides volatile actors that exchange messages within an actor system or across explicitly associated actor systems. The model preserves actor identity and message-ordering boundaries without implying durable delivery or clustering.
+Movie provides volatile actors that exchange messages within an actor system or across explicitly associated actor systems. Optional cluster membership remains separate from remoting associations and does not imply durable delivery.
 
 ## Language
 
@@ -59,3 +59,51 @@ _Avoid_: Cluster event, delivery acknowledgement
 **Remoting Metrics Snapshot**:
 An immutable view of cumulative remoting counters for one actor system incarnation. It does not imply remote receipt or actor processing.
 _Avoid_: Delivery confirmation, durable metric
+
+**Cluster**:
+A named volatile membership domain containing accepted actor system incarnations.
+_Avoid_: Actor system, association, durable registry
+
+**Cluster Member**:
+One specific actor system incarnation accepted into a cluster. Restarting the actor system creates a different member.
+_Avoid_: Endpoint, actor system name, process
+
+**Member Identity**:
+The immutable combination of an actor system name and actor system incarnation UID within one cluster.
+_Avoid_: Endpoint, actor identity, actor system name alone
+
+**Membership Coordinator**:
+The statically configured cluster member that serializes membership changes in the initial cluster protocol.
+_Avoid_: Association initiator, remoting listener, elected leader
+
+**Seed Contact**:
+The configured actor system name and endpoint used to contact the membership coordinator.
+_Avoid_: Member identity, discovery service, endpoint alone
+
+**Member Status**:
+A cluster member's membership lifecycle state: joining, up, leaving, or left.
+_Avoid_: Reachability, association state
+
+**Reachability**:
+A failure detector's local observation that a cluster member is reachable or unreachable. An unreachable member remains a cluster member.
+_Avoid_: Member status, proof of failure, association state
+
+**Heartbeat**:
+A bounded cluster-control exchange that provides recent evidence of reachability.
+_Avoid_: Delivery acknowledgement, user-message acknowledgement
+
+**Failure Detector**:
+A local time-based mechanism that changes reachability observations when heartbeat evidence is absent. It cannot prove failure or resolve a network partition.
+_Avoid_: Membership coordinator, split-brain resolver
+
+**Downing**:
+An explicit membership decision that transitions one exact unreachable member to left so a replacement incarnation may join.
+_Avoid_: Failure detection, proof of failure, automatic removal
+
+**Graceful Leave**:
+A bounded best-effort membership transition that is attempted before remoting shuts down. It does not drain actor mailboxes or guarantee that every member observed the departure.
+_Avoid_: Actor system shutdown, durable acknowledgement
+
+**Cluster Membership Event**:
+A volatile local notification about a membership or reachability transition. Its bounded event window is not a durable event log.
+_Avoid_: Remoting health event, consensus result

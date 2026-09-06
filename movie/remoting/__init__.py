@@ -36,6 +36,7 @@ from movie.remoting.errors import (
     WireCodecError,
     WrongStreamError,
 )
+from movie.remoting.extension import REMOTING, RemotingExtension
 from movie.remoting.observability import (
     RemotingHealthEvent,
     RemotingHealthEventKind,
@@ -160,9 +161,11 @@ __all__ = [
     "ReasonCode",
     "RecipientUnavailable",
     "RemoteActorRef",
+    "REMOTING",
     "RemotingCapacityError",
     "RemotingConfig",
     "RemotingError",
+    "RemotingExtension",
     "RemotingHealthEvent",
     "RemotingHealthEventKind",
     "RemotingHealthEventSubscription",

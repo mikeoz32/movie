@@ -1,7 +1,12 @@
 from movie.actor.behaviour import AbstractBehavior, Behaviors
 from movie.actor.context import ActorContext
 from movie.actor.dead_letter import DeadLetter, DeadLetterReason
-from movie.actor.extension import Extension, ExtensionId, ManagedExtension
+from movie.actor.extension import (
+    Extension,
+    ExtensionId,
+    ManagedExtension,
+    PreActorStopExtension,
+)
 from movie.actor.identity import ActorIdentity
 from movie.actor.ref import ActorRef
 from movie.actor.supervision import SupervisorDirective
@@ -19,5 +24,6 @@ __all__ = [
     "Extension",
     "ExtensionId",
     "ManagedExtension",
+    "PreActorStopExtension",
     "SupervisorDirective",
 ]

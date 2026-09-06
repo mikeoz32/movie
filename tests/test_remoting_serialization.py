@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from queue import Queue
+from threading import Event, Lock, Thread
 from uuid import UUID
 
 import pytest
@@ -87,6 +89,72 @@ def test_registry_is_an_immutable_snapshot_of_builder_state():
     assert [item.serializer_id for item in registry.descriptors] == [7]
     with pytest.raises(TypeError):
         registry.bindings[Message] = registry.bindings[Message]  # type: ignore[index]
+
+
+def test_registry_include_preserves_serializer_lock_across_snapshots() -> None:
+    first_entered = Event()
+    release_first = Event()
+    second_entered = Event()
+    calls_lock = Lock()
+    errors: Queue[BaseException] = Queue()
+
+    class BlockingSerializer(TextSerializer):
+        def serialize(self, value: object, manifest: str, protocol_minor: int) -> bytes:
+            with calls_lock:
+                self.serialize_calls += 1
+                call = self.serialize_calls
+            if call == 1:
+                first_entered.set()
+                if not release_first.wait(1.0):
+                    raise TimeoutError("test did not release the first serializer call")
+            else:
+                second_entered.set()
+            return super().serialize(value, manifest, protocol_minor)
+
+    serializer = BlockingSerializer()
+    original = (
+        SerializerRegistryBuilder()
+        .register(descriptor(), serializer)
+        .bind(Message, 7, "message/v1")
+        .build()
+    )
+    included = SerializerRegistryBuilder().include(original).build()
+
+    def serialize(registry) -> None:
+        try:
+            registry.serialize(Message("value"))
+        except BaseException as error:
+            errors.put_nowait(error)
+
+    first = Thread(target=serialize, args=(original,))
+    second = Thread(target=serialize, args=(included,))
+    try:
+        first.start()
+        assert first_entered.wait(1.0)
+        second.start()
+        assert not second_entered.wait(0.05)
+    finally:
+        release_first.set()
+        first.join(1.0)
+        second.join(1.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors.empty()
+    assert second_entered.is_set()
+
+
+def test_registry_include_rejects_non_registry_and_existing_conflicts() -> None:
+    registry = SerializerRegistryBuilder().register(descriptor(), TextSerializer()).build()
+
+    with pytest.raises(SerializerRegistryError, match="SerializerRegistry"):
+        SerializerRegistryBuilder().include(object())  # type: ignore[arg-type]
+    with pytest.raises(SerializerRegistryError, match="already registered"):
+        (
+            SerializerRegistryBuilder()
+            .register(descriptor(), TextSerializer())
+            .include(registry)
+        )
 
 
 def test_route_is_checked_before_serializer_is_called():

@@ -12,6 +12,7 @@ Remoting v1 connects explicitly configured actor-system endpoints through a tran
 - TCP was selected because it is available on every supported Python platform and its ordered byte stream is sufficient for the v1 protocol. Logical delivery lanes preserve the protocol's FIFO boundaries without requiring transport-level streams.
 - Binding association semantics directly to QUIC was rejected. QUIC remains a possible optional transport behind the same interface when a production-quality free-threaded Python implementation is available.
 - Discovery and clustering were deferred so an association remains a direct relationship between two known actor-system incarnations rather than membership in a distributed runtime.
+- Cluster membership was subsequently added as a separate application protocol in [ADR-0003](0003-layer-coordinated-cluster-membership-over-remoting.md); it does not change the remoting association boundary.
 - Transport encryption and mutual authentication were deferred. V1 trusts the deployment network and the identity claimed by its peers.
 
 ## Consequences

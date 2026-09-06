@@ -345,6 +345,8 @@ An implementation must expose, at minimum:
 
 ## Runtime Foundations
 
+The stable `REMOTING` Actor System `ExtensionId` owns one `RemotingExtension` per configured Actor System. A dependent extension resolves it through the extension registry. The registry starts dependencies before dependents and stops them in reverse order; during cluster shutdown, remoting remains active until cluster membership has attempted its bounded graceful leave.
+
 The implementation provides these local foundations:
 
 - actor-system incarnation UIDs and nonzero actor UIDs are first-class identity values;

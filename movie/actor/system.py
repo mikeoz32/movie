@@ -18,8 +18,10 @@ from movie.actor.ref import ActorRef, InternalActorRef
 from movie.config import Config
 
 if TYPE_CHECKING:
+    from movie.cluster.config import ClusterConfig
+    from movie.cluster.extension import ClusterExtension
     from movie.remoting.config import RemotingConfig
-    from movie.remoting.runtime import RemotingRuntime
+    from movie.remoting.extension import RemotingExtension
 
 
 E = TypeVar("E", bound=Extension)
@@ -102,7 +104,10 @@ class ActorSystem(ActorRef[MessageType], Protocol):
     def dead_letters(self) -> DeadLetterBroker[DeadLetter]: ...
 
     @property
-    def remoting(self) -> RemotingRuntime | None: ...
+    def remoting(self) -> RemotingExtension | None: ...
+
+    @property
+    def cluster(self) -> ClusterExtension | None: ...
 
     def extension(self, extension_id: ExtensionId[E]) -> E: ...
 
@@ -113,6 +118,7 @@ class ActorSystem(ActorRef[MessageType], Protocol):
         *,
         config: Config | None = None,
         remoting: RemotingConfig | None = None,
+        cluster: ClusterConfig | None = None,
     ) -> "ActorSystem":
         is_gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)
         if (
@@ -130,7 +136,17 @@ class ActorSystem(ActorRef[MessageType], Protocol):
             except ImportError as e:
                 raise NotImplementedError("No ActorSystem implementation available", e)
 
-        if remoting is None:
+        if cluster is not None and remoting is None:
+            raise ValueError("cluster membership requires remoting configuration")
+        if cluster is not None:
+            system = ActorSystem._impl(
+                behavior,
+                name,
+                config=config,
+                remoting=remoting,
+                cluster=cluster,
+            )
+        elif remoting is None:
             system = ActorSystem._impl(behavior, name, config=config)
         else:
             system = ActorSystem._impl(

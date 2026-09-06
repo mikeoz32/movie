@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import pytest
 
 from movie.actor import AbstractBehavior, ActorSystem, Behaviors, ExtensionId
+from movie.actor.impl.system import ActorSystemImpl
 
 
 @dataclass
@@ -223,6 +224,122 @@ def test_partially_started_extension_is_stopped_after_failure() -> None:
         system.stop()
 
 
+def test_extension_does_not_restart_after_startup_cleanup_fails() -> None:
+    events = []
+
+    class DirtyExtension:
+        def start(self) -> None:
+            events.append("start")
+            raise RuntimeError("injected startup failure")
+
+        def stop(self, timeout: float) -> None:
+            events.append("stop")
+            if events.count("stop") == 1:
+                raise RuntimeError("injected cleanup failure")
+
+    extension_id = ExtensionId("dirty", lambda system: DirtyExtension())
+    system = create_system("extension-cleanup-failure")
+
+    with pytest.raises(RuntimeError, match="injected startup failure"):
+        extension_id.get(system)
+    with pytest.raises(RuntimeError, match="failed during startup"):
+        extension_id.get(system)
+
+    system.stop()
+
+    assert events == ["start", "stop", "stop"]
+
+def test_configured_extension_stops_when_actor_startup_fails() -> None:
+    events = []
+    extension_id = ExtensionId(
+        "configured-startup-failure",
+        lambda system: RecordingExtension(events, "configured"),
+    )
+
+    def fail_setup(context):
+        raise RuntimeError("injected actor startup failure")
+
+    system = ActorSystemImpl(
+        Behaviors.setup(fail_setup),
+        "configured-extension-startup-failure",
+    )
+    extension = system._extensions.configure(extension_id)
+
+    with pytest.raises(RuntimeError, match="Root actor failed during startup"):
+        system.start()
+
+    assert events == ["stop:configured"]
+    assert system._extensions.find(extension_id) is extension
+
+
+def test_unstarted_configured_extension_stops_before_started_dependency() -> None:
+    events = []
+    first = ExtensionId("configured-first", lambda system: RecordingExtension(events, "first"))
+    second = ExtensionId(
+        "configured-second",
+        lambda system: RecordingExtension(events, "second"),
+    )
+
+    def fail_after_starting_dependency(context):
+        first.get(context.get_system())
+        raise RuntimeError("injected actor startup failure")
+
+    system = ActorSystemImpl(
+        Behaviors.setup(fail_after_starting_dependency),
+        "configured-extension-order",
+    )
+    system._extensions.configure(first)
+    system._extensions.configure(second)
+
+    with pytest.raises(RuntimeError, match="Root actor failed during startup"):
+        system.start()
+
+    assert events == ["start:first", "stop:second", "stop:first"]
+
+
+def test_starting_extension_can_be_interrupted_by_shutdown() -> None:
+    events = []
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    errors = []
+
+    class StartingExtension:
+        def start(self) -> None:
+            events.append("start")
+            start_entered.set()
+            assert release_start.wait(1.0)
+
+        def prepare_stop(self, timeout: float) -> None:
+            events.append("prepare")
+            release_start.set()
+
+        def stop(self, timeout: float) -> None:
+            events.append("stop")
+
+    extension_id = ExtensionId("starting-extension", lambda system: StartingExtension())
+    system = create_system("extension-start-interruption")
+
+    def lookup() -> None:
+        try:
+            extension_id.get(system)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=lookup)
+    worker.start()
+    try:
+        assert start_entered.wait(1.0)
+        system.stop(1.0)
+    finally:
+        release_start.set()
+        worker.join(1.0)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert events == ["start", "prepare", "stop"]
+
+
 def test_actor_post_stop_runs_before_extension_shutdown() -> None:
     events = []
     extension_id = ExtensionId(
@@ -251,4 +368,49 @@ def test_actor_post_stop_runs_before_extension_shutdown() -> None:
         "start:post-stop",
         "actor:post-stop",
         "stop:post-stop",
+    ]
+
+
+def test_pre_actor_stop_extensions_prepare_in_reverse_start_order() -> None:
+    events = []
+
+    @dataclass
+    class PreparedExtension(RecordingExtension):
+        def prepare_stop(self, timeout: float) -> None:
+            assert timeout > 0
+            events.append(f"prepare:{self.name}")
+
+    first = ExtensionId("prepared-first", lambda system: PreparedExtension(events, "first"))
+    second = ExtensionId("prepared-second", lambda system: PreparedExtension(events, "second"))
+
+    class PostStopBehavior(AbstractBehavior):
+        def receive(self, context, message):
+            return Behaviors.same
+
+        def on_signal(self, context, message) -> None:
+            if isinstance(message, ActorSystem.PostStop):
+                assert first.get(context.get_system()).name == "first"
+                with pytest.raises(RuntimeError, match="new extensions"):
+                    ExtensionId("too-late", lambda system: object()).get(
+                        context.get_system()
+                    )
+                events.append("actor:post-stop")
+
+    system = ActorSystem.create(
+        Behaviors.setup(lambda context: PostStopBehavior(context)),
+        "extension-prepare",
+    )
+    first.get(system)
+    second.get(system)
+
+    system.stop()
+
+    assert events == [
+        "start:first",
+        "start:second",
+        "prepare:second",
+        "prepare:first",
+        "actor:post-stop",
+        "stop:second",
+        "stop:first",
     ]

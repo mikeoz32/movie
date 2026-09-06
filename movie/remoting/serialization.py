@@ -303,6 +303,30 @@ class SerializerRegistryBuilder:
         self._names: dict[str, int] = {}
         self._bindings: dict[type[object], SerializerBinding] = {}
 
+    def include(self, registry: SerializerRegistry) -> SerializerRegistryBuilder:
+        """Copy an immutable registry into this builder before adding bindings."""
+        if not isinstance(registry, SerializerRegistry):
+            raise SerializerRegistryError("included serializers must be a SerializerRegistry")
+        for serializer_id, registration in registry._registrations.items():
+            descriptor = registration.descriptor
+            if serializer_id in self._registrations:
+                raise SerializerRegistryError(
+                    f"serializer ID {serializer_id} is already registered"
+                )
+            if descriptor.name in self._names:
+                raise SerializerRegistryError(
+                    f"serializer name {descriptor.name!r} is already registered"
+                )
+            self._registrations[serializer_id] = registration
+            self._names[descriptor.name] = serializer_id
+        for binding in registry.bindings.values():
+            self.bind(
+                binding.message_type,
+                binding.serializer_id,
+                binding.manifest,
+            )
+        return self
+
     def register(
         self, descriptor: SerializerDescriptor, serializer: Serializer
     ) -> SerializerRegistryBuilder:

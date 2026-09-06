@@ -1,12 +1,12 @@
 # Movie
 
-Movie is a typed actor runtime for local and explicitly associated remote actor systems on free-threaded CPython 3.14t. It provides hierarchical actors, supervision, bounded mailboxes, configurable dispatchers, lifecycle signals, direct TCP remoting, and a small backpressured streams DSL.
+Movie is a typed actor runtime for local and remote actor systems on free-threaded CPython 3.14t. It provides hierarchical actors, supervision, bounded mailboxes, configurable dispatchers, lifecycle signals, direct TCP remoting, optional volatile cluster membership, and a small backpressured streams DSL.
 
 ## Production Scope
 
-Actor state, mailboxes, stream state, and messages are volatile and are lost when the process exits. Remoting provides direct, allowlisted actor-system associations; it does not provide durable delivery, persistence, clustering, discovery, authentication, or an HTTP health endpoint.
+Actor state, mailboxes, stream state, cluster membership, and messages are volatile and are lost when the process exits. Remoting provides direct, allowlisted actor-system associations; the optional cluster layer adds coordinated membership but not durable delivery, persistence, discovery, authentication, coordinator failover, or an HTTP health endpoint.
 
-The remoting v1 contract is documented in [`docs/remoting-v1.md`](docs/remoting-v1.md). It specifies direct TCP associations behind a transport abstraction, at-most-once delivery, explicit serializers, and a trusted-network boundary. See [`CONTEXT.md`](CONTEXT.md) for canonical terminology and [ADR-0001](docs/adr/0001-remoting-v1-boundaries.md) for the architectural decision.
+The remoting v1 contract is documented in [`docs/remoting-v1.md`](docs/remoting-v1.md), and the separate cluster contract is documented in [`docs/cluster-v1.md`](docs/cluster-v1.md). Remoting specifies direct TCP associations behind a transport abstraction, at-most-once delivery, explicit serializers, and a trusted-network boundary. See [`CONTEXT.md`](CONTEXT.md) for canonical terminology and the ADRs under [`docs/adr`](docs/adr).
 
 The runtime guarantees:
 
@@ -135,6 +135,61 @@ Subscribe through `system.remoting.health_events.subscribe()` for a bounded stre
 
 In canonical `HELLO_ACCEPT`, `outbound_*` is the effective initiator-to-responder direction and `inbound_*` is responder-to-initiator. A responder therefore uses the wire `inbound_*` fields as its own send limits.
 
+## Cluster Membership
+
+Cluster membership is enabled with an immutable `ClusterConfig` in addition to `RemotingConfig`. Cluster v1 uses one statically configured Membership Coordinator. The coordinator and each participant must reciprocally allowlist one another in remoting; participants do not need direct associations with each other.
+
+Remoting and cluster membership are Actor System extensions exposed by the stable `REMOTING` and `CLUSTER` extension IDs. Configuration passed to `ActorSystem.create()` preconfigures those extensions; normal application access remains `system.remoting` and `system.cluster`. The cluster extension depends on remoting, so reverse extension shutdown attempts cluster leave before remoting and its I/O dependency stop.
+
+```python
+from movie.actor import ActorSystem, Behaviors
+from movie.cluster import ClusterConfig, SeedContact
+from movie.remoting import Endpoint, RemotingConfig, SerializerRegistryBuilder
+
+seed_endpoint = Endpoint("127.0.0.1", 7201)
+member_endpoint = Endpoint("127.0.0.1", 7202)
+cluster = ClusterConfig(
+    "render-cluster",
+    SeedContact("render-seed", seed_endpoint),
+)
+
+seed = ActorSystem.create(
+    Behaviors.receive(lambda context, message: Behaviors.same),
+    "render-seed",
+    remoting=RemotingConfig(
+        seed_endpoint,
+        {"render-worker": member_endpoint},
+        SerializerRegistryBuilder().build(),
+    ),
+    cluster=cluster,
+)
+worker = ActorSystem.create(
+    Behaviors.receive(lambda context, message: Behaviors.same),
+    "render-worker",
+    remoting=RemotingConfig(
+        member_endpoint,
+        {"render-seed": seed_endpoint},
+        SerializerRegistryBuilder().build(),
+    ),
+    cluster=cluster,
+)
+
+assert worker.cluster.is_joined
+assert {member.identity.system_name for member in seed.cluster.members} == {
+    "render-seed",
+    "render-worker",
+}
+
+worker.stop()  # Attempts bounded graceful leave before remoting shutdown.
+seed.stop()
+```
+
+`system.cluster.membership` is an immutable local snapshot. Its revision changes whenever that local view changes. `system.cluster.events` is a bounded nonblocking stream of member status and reachability transitions. Heartbeats can mark an `UP` member `UNREACHABLE`, but failure detection never proves failure and never removes membership automatically.
+
+After an operational decision that an exact unreachable incarnation must not return, call `seed.cluster.down(member.identity)` on the Membership Coordinator. Downing transitions only that identity to `LEFT`, allowing a replacement incarnation with the same actor-system name to join. Do not down solely because of a short association interruption or without a deployment-specific partition policy.
+
+Cluster control records use a built-in serializer composed with the application registry. The seed, `heartbeat_interval`, `unreachable_timeout`, `member_limit`, `retired_identity_limit`, and `serializer_id` must match on every participant and are verified during join; the serializer ID must also be collision-free in each application registry. Cluster v1 has no dynamic endpoint admission, gossip, coordinator election or failover, automatic downing, split-brain resolver, role-based placement, singleton, sharding, or durable membership.
+
 ## Streams Example
 
 ```python
@@ -198,6 +253,8 @@ The current server supports HTTP/1.1, strict bounded request entities framed by 
 Movie optionally reads `movie.toml` from the current working directory by default. Set `MOVIE_CONFIG` to an explicit path in deployed processes; a missing explicit path fails startup. Configuration is trusted because dispatcher and mailbox `type` entries load Python classes.
 
 See [`movie.toml.example`](movie.toml.example) for all production-relevant settings.
+
+Remoting topology and cluster membership are configured programmatically through immutable `RemotingConfig` and `ClusterConfig` values rather than `movie.toml`.
 
 Key capacity behavior:
 
