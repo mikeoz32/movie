@@ -35,6 +35,12 @@ SQLite Durable State uses an optional asynchronous driver:
 uv add "movie-actor-runtime[persistence-sqlite]"
 ```
 
+The runnable applications in this repository use the `examples` extra:
+
+```console
+uv sync --python 3.14t --extra examples
+```
+
 For development:
 
 ```console
@@ -272,24 +278,28 @@ projection = PROJECTIONS.get(system).run_at_least_once(
 
 At-least-once handlers may receive the same batch again after failure and must be idempotent. `run_exactly_once` instead gives the handler a restricted SQLite transaction so read-model writes and the Projection Offset commit atomically in the persistence database. It does not make external effects exactly-once. See [`docs/projections-v1.md`](docs/projections-v1.md) for source, slice, retry, baseline, compaction, ownership, and shutdown semantics.
 
-### Complete Durable Order Example
+### FastAPI Order Service
 
-[`examples/durable_orders.py`](examples/durable_orders.py) is an executable order-processing application that combines the persistence and Projection APIs:
+[`examples/durable_orders.py`](examples/durable_orders.py) is a small long-running order API. FastAPI's lifespan starts one Movie Actor System plus an exactly-once order-summary Projection and an at-least-once audit Projection, then stops them on application shutdown. There is no scripted restart or injected failure in the application.
 
-- a `DurableStateBehavior` owns each order and recovers it after an Actor System restart;
-- a payment is retried with the same `OperationId` after its acknowledgement is deliberately ignored, without adding a Revision or Change Feed entry;
-- a SQLite exactly-once Projection updates an order summary, append-only history, and transactional notification outbox;
-- an at-least-once Projection writes to a separate audit database with `(PersistenceId, OperationId)` as its idempotency key;
-- both handlers inject one retryable failure to demonstrate replay without duplicate effects;
-- an abandoned order becomes a retained tombstone, and the app performs bounded compaction, demonstrates baseline-required rejection, then uses explicit-baseline registration and retirement.
+Each Order Identity is owned by one lazily created `DurableStateBehavior`. Synchronous FastAPI handlers run in Starlette worker threads, wait for the post-commit actor reply, and require a UUID `Idempotency-Key` that can be reused for retries. `GET` reads the eventually consistent summary Projection; audit rows are written idempotently to a separate SQLite database. Archiving writes a tombstone, and `POST /admin/compact` performs one safe bounded Change Feed compaction call.
 
-Run it from a checkout with the SQLite extra installed:
+Run the service and open `http://127.0.0.1:8080/docs` for its generated API documentation:
 
 ```console
-uv run --python 3.14t python -m examples.durable_orders --reset
+uv run --python 3.14t --extra examples python -m examples.durable_orders
 ```
 
-The default databases are written under `.movie-example/durable-orders`. Omit `--reset` to retain prior state and use a newly generated Order Identity, or combine `--order-id` with `--reset` for a repeatable run.
+Create an order:
+
+```console
+curl -X POST http://127.0.0.1:8080/orders \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 00000000-0000-0000-0000-000000000001" \
+  -d '{"order_id":"order-1001","customer_id":"customer-42","lines":[{"sku":"keyboard","quantity":1,"unit_price_cents":12500}]}'
+```
+
+The API exposes `POST /orders`, payment and shipment commands, `GET /orders`, `GET /orders/{order_id}`, `GET /orders/{order_id}/audit`, `DELETE /orders/{order_id}`, `GET /health`, and `POST /admin/compact`. Data is retained under `.movie-example/order-service` by default.
 
 ## Streams Example
 

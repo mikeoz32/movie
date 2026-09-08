@@ -19,6 +19,11 @@ classifiers = [
 persistence-sqlite = [
     "aiosqlite>=0.22.1,<0.23",
 ]
+examples = [
+    "aiosqlite>=0.22.1,<0.23",
+    "fastapi>=0.116,<1",
+    "uvicorn>=0.35,<1",
+]
 
 [project.urls]
 Homepage = "https://github.com/mikeoz32/movie"
@@ -38,6 +43,8 @@ packages = ["movie"]
 [dependency-groups]
 test = [
     "aiosqlite>=0.22.1,<0.23",
+    "fastapi>=0.116,<1",
+    "httpx>=0.28,<1",
     "pytest>=8.4.2",
     "pytest-cov>=6.2.1",
     "pytest-timeout>=2.4.0",

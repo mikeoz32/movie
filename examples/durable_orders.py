@@ -3,19 +3,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
-import time
-from collections.abc import Callable, Sequence
-from contextlib import closing
+from collections.abc import Sequence
+from concurrent.futures import Future, InvalidStateError
+from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass, replace
+from hashlib import sha256
 from pathlib import Path
-from queue import Queue
-from uuid import uuid4
+from threading import Lock
+from typing import Annotated
+from uuid import UUID
 
-from movie.actor import ActorContext, ActorSystem, Behaviors
+from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
+
+from movie.actor import ActorContext, ActorRef, ActorSystem, Behaviors
 from movie.config import Config
+from movie.mailbox.mailbox import MailboxCapacityExceeded
 from movie.persistence import (
-    DURABLE_STATE,
     PERSISTENCE_SLICE_COUNT,
     DurableEffect,
     DurableStateBehavior,
@@ -23,17 +29,39 @@ from movie.persistence import (
     EncodedState,
     OperationId,
     PersistenceId,
-    persistence_slice,
 )
-from movie.projection import (
-    PROJECTIONS,
-    ProjectionBaselineError,
-    ProjectionId,
-    ProjectionTransaction,
-)
+from movie.projection import PROJECTIONS, ProjectionId, ProjectionTransaction
 
 ORDER_ENTITY_TYPE = "order"
 ORDER_MANIFEST = "order-state/v1"
+
+
+class OrderLineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sku: str = Field(min_length=1, max_length=128)
+    quantity: int = Field(gt=0, le=1_000)
+    unit_price_cents: int = Field(ge=0, le=100_000_000)
+
+
+class CreateOrderInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    order_id: str = Field(min_length=1, max_length=128)
+    customer_id: str = Field(min_length=1, max_length=128)
+    lines: list[OrderLineInput] = Field(min_length=1, max_length=100)
+
+
+class PaymentInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    payment_id: str = Field(min_length=1, max_length=128)
+
+
+class ShipmentInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tracking_number: str = Field(min_length=1, max_length=128)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,12 +72,21 @@ class OrderLine:
 
 
 @dataclass(frozen=True, slots=True)
+class CommandReceipt:
+    operation_id: str
+    fingerprint: str
+    revision: int
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
 class OrderState:
     customer_id: str = ""
     lines: tuple[OrderLine, ...] = ()
     status: str = "empty"
     payment_id: str | None = None
     tracking_number: str | None = None
+    receipts: tuple[CommandReceipt, ...] = ()
 
     @property
     def total_cents(self) -> int:
@@ -57,16 +94,12 @@ class OrderState:
 
 
 @dataclass(frozen=True, slots=True)
-class OrderAck:
+class CommandResult:
     operation_id: OperationId
+    accepted: bool
     revision: int
     status: str
-
-
-@dataclass(frozen=True, slots=True)
-class OrderRecovered:
-    state: OrderState
-    revision: int
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,27 +107,27 @@ class PlaceOrder:
     customer_id: str
     lines: tuple[OrderLine, ...]
     operation_id: OperationId
-    reply_to: Queue[OrderAck]
+    reply: Future[CommandResult]
 
 
 @dataclass(frozen=True, slots=True)
 class RecordPayment:
     payment_id: str
     operation_id: OperationId
-    reply_to: Queue[OrderAck]
+    reply: Future[CommandResult]
 
 
 @dataclass(frozen=True, slots=True)
 class ShipOrder:
     tracking_number: str
     operation_id: OperationId
-    reply_to: Queue[OrderAck]
+    reply: Future[CommandResult]
 
 
 @dataclass(frozen=True, slots=True)
 class ArchiveOrder:
     operation_id: OperationId
-    reply_to: Queue[OrderAck]
+    reply: Future[CommandResult]
 
 
 OrderCommand = PlaceOrder | RecordPayment | ShipOrder | ArchiveOrder
@@ -113,6 +146,15 @@ class OrderCodec:
                 for line in state.lines
             ],
             "payment_id": state.payment_id,
+            "receipts": [
+                {
+                    "fingerprint": receipt.fingerprint,
+                    "operation_id": receipt.operation_id,
+                    "revision": receipt.revision,
+                    "status": receipt.status,
+                }
+                for receipt in state.receipts
+            ],
             "status": state.status,
             "tracking_number": state.tracking_number,
         }
@@ -131,6 +173,9 @@ class OrderCodec:
             status=document["status"],
             payment_id=document["payment_id"],
             tracking_number=document["tracking_number"],
+            receipts=tuple(
+                CommandReceipt(**receipt) for receipt in document["receipts"]
+            ),
         )
 
 
@@ -139,16 +184,15 @@ class OrderBehavior(DurableStateBehavior[OrderCommand, OrderState]):
         self,
         context: ActorContext[OrderCommand],
         order_id: str,
-        recovered: Queue[OrderRecovered],
     ) -> None:
-        self._recovered = recovered
-        super().__init__(context, PersistenceId(ORDER_ENTITY_TYPE, order_id), OrderCodec())
+        super().__init__(
+            context,
+            PersistenceId(ORDER_ENTITY_TYPE, order_id),
+            OrderCodec(),
+        )
 
     def empty_state(self) -> OrderState:
         return OrderState()
-
-    def on_recovery_completed(self, state: OrderState, revision: int) -> None:
-        self._recovered.put_nowait(OrderRecovered(state, revision))
 
     def handle_command(
         self,
@@ -156,155 +200,207 @@ class OrderBehavior(DurableStateBehavior[OrderCommand, OrderState]):
         command: OrderCommand,
         context: ActorContext[OrderCommand],
     ) -> DurableEffect[OrderState]:
+        fingerprint = _command_fingerprint(command)
+        previous = next(
+            (
+                receipt
+                for receipt in state.receipts
+                if receipt.operation_id == str(command.operation_id)
+            ),
+            None,
+        )
+        if previous is not None:
+            if previous.fingerprint != fingerprint:
+                return self._reject(command, "Idempotency-Key was used for another command")
+            return self.none().then_run(
+                lambda current: _set_reply(
+                    command.reply,
+                    CommandResult(
+                        command.operation_id,
+                        True,
+                        previous.revision,
+                        previous.status,
+                    ),
+                )
+            )
+
         if isinstance(command, PlaceOrder):
-            if state.status != "empty":
-                raise ValueError("an order can only be placed once")
-            if not command.lines or any(line.quantity <= 0 for line in command.lines):
-                raise ValueError("an order requires positive line quantities")
+            if self.revision > 0:
+                return self._reject(command, "order ID already exists")
             next_state = OrderState(
                 customer_id=command.customer_id,
                 lines=command.lines,
                 status="awaiting-payment",
             )
-            return self._persist_with_ack(next_state, command)
+            return self._persist(next_state, command, fingerprint)
 
         if isinstance(command, RecordPayment):
-            if state.status == "awaiting-payment":
-                next_state = replace(
-                    state,
-                    status="paid",
-                    payment_id=command.payment_id,
-                )
-            elif state.status == "paid" and state.payment_id == command.payment_id:
-                # The identical replacement lets the Store recognize an uncertain retry.
-                next_state = state
-            else:
-                raise ValueError("only an awaiting-payment order can be paid")
-            return self._persist_with_ack(next_state, command)
+            if state.status != "awaiting-payment":
+                return self._reject(command, "order is not awaiting payment")
+            return self._persist(
+                replace(state, status="paid", payment_id=command.payment_id),
+                command,
+                fingerprint,
+            )
 
         if isinstance(command, ShipOrder):
             if state.status != "paid":
-                raise ValueError("only a paid order can be shipped")
-            return self._persist_with_ack(
+                return self._reject(command, "order is not paid")
+            return self._persist(
                 replace(
                     state,
                     status="shipped",
                     tracking_number=command.tracking_number,
                 ),
                 command,
+                fingerprint,
             )
 
-        if state.status != "awaiting-payment":
-            raise ValueError("only an abandoned awaiting-payment order can be archived")
+        if state.status == "empty":
+            if self.revision == 0:
+                return self._reject(command, "order does not exist")
+            return self.none().then_run(
+                lambda current: _set_reply(
+                    command.reply,
+                    CommandResult(
+                        command.operation_id,
+                        True,
+                        self.revision,
+                        "archived",
+                    ),
+                )
+            )
+        if state.status != "shipped":
+            return self._reject(command, "only a shipped order can be archived")
         return self.delete(command.operation_id).then_run(
-            lambda current: command.reply_to.put_nowait(
-                OrderAck(command.operation_id, self.revision, current.status)
+            lambda current: _set_reply(
+                command.reply,
+                CommandResult(command.operation_id, True, self.revision, "archived"),
             )
         )
 
-    def _persist_with_ack(
+    def _persist(
         self,
         state: OrderState,
         command: PlaceOrder | RecordPayment | ShipOrder,
+        fingerprint: str,
     ) -> DurableEffect[OrderState]:
-        return self.persist(state, command.operation_id).then_run(
-            lambda current: command.reply_to.put_nowait(
-                OrderAck(command.operation_id, self.revision, current.status)
+        receipt = CommandReceipt(
+            str(command.operation_id),
+            fingerprint,
+            self.revision + 1,
+            state.status,
+        )
+        candidate = replace(state, receipts=(*state.receipts, receipt))
+        return self.persist(candidate, command.operation_id).then_run(
+            lambda current: _set_reply(
+                command.reply,
+                CommandResult(
+                    command.operation_id,
+                    True,
+                    receipt.revision,
+                    receipt.status,
+                ),
+            )
+        )
+
+    def _reject(
+        self,
+        command: OrderCommand,
+        message: str,
+    ) -> DurableEffect[OrderState]:
+        return self.none().then_run(
+            lambda current: _set_reply(
+                command.reply,
+                CommandResult(
+                    command.operation_id,
+                    False,
+                    self.revision,
+                    current.status,
+                    message,
+                ),
             )
         )
 
 
-class OrderSummaryProjection:
-    def __init__(self, *, fail_first_attempt: bool) -> None:
-        self.attempts = 0
-        self.retry_injected = False
-        self._fail_first_attempt = fail_first_attempt
+def _set_reply(reply: Future[CommandResult], result: CommandResult) -> None:
+    try:
+        reply.set_result(result)
+    except InvalidStateError:
+        pass
 
-    async def handle(
-        self,
-        transaction: ProjectionTransaction,
-        changes: tuple[DurableStateChange, ...],
-    ) -> None:
-        self.attempts += 1
-        codec = OrderCodec()
-        for change in changes:
-            order_id = change.persistence_id.entity_id
-            if change.deleted:
-                await transaction.execute(
-                    "DELETE FROM order_summary WHERE order_id = ?",
-                    (order_id,),
-                )
-                notification_type = "order-archived"
-                payload = json.dumps({"order_id": order_id, "revision": change.revision})
-            else:
-                assert change.manifest is not None and change.payload is not None
-                state = codec.decode(change.manifest, change.payload)
-                await transaction.execute(
-                    """
-                    INSERT INTO order_summary (
-                        order_id, customer_id, status, item_count, total_cents,
-                        revision, tracking_number
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(order_id) DO UPDATE SET
-                        customer_id = excluded.customer_id,
-                        status = excluded.status,
-                        item_count = excluded.item_count,
-                        total_cents = excluded.total_cents,
-                        revision = excluded.revision,
-                        tracking_number = excluded.tracking_number
-                    """,
-                    (
-                        order_id,
-                        state.customer_id,
-                        state.status,
-                        sum(line.quantity for line in state.lines),
-                        state.total_cents,
-                        change.revision,
-                        state.tracking_number,
-                    ),
-                )
-                notification_type = f"order-{state.status}"
-                payload = change.payload.decode("utf-8")
 
+def _command_fingerprint(command: OrderCommand) -> str:
+    if isinstance(command, PlaceOrder):
+        document = {
+            "command": "place",
+            "customer_id": command.customer_id,
+            "lines": [
+                [line.sku, line.quantity, line.unit_price_cents]
+                for line in command.lines
+            ],
+        }
+    elif isinstance(command, RecordPayment):
+        document = {"command": "payment", "payment_id": command.payment_id}
+    elif isinstance(command, ShipOrder):
+        document = {
+            "command": "shipment",
+            "tracking_number": command.tracking_number,
+        }
+    else:
+        document = {"command": "archive"}
+    encoded = json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
+    return sha256(encoded).hexdigest()
+
+
+async def update_order_summary(
+    transaction: ProjectionTransaction,
+    changes: tuple[DurableStateChange, ...],
+) -> None:
+    codec = OrderCodec()
+    for change in changes:
+        order_id = change.persistence_id.entity_id
+        if change.deleted:
             await transaction.execute(
-                """
-                INSERT INTO order_projection_history (order_id, revision, status)
-                VALUES (?, ?, ?)
-                """,
-                (order_id, change.revision, notification_type),
+                "DELETE FROM order_summary WHERE order_id = ?",
+                (order_id,),
             )
-            await transaction.execute(
-                """
-                INSERT INTO order_outbox (
-                    operation_id, order_id, notification_type, payload
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(order_id, operation_id) DO NOTHING
-                """,
-                (str(change.operation_id), order_id, notification_type, payload),
-            )
+            continue
+        assert change.manifest is not None and change.payload is not None
+        state = codec.decode(change.manifest, change.payload)
+        document = json.loads(change.payload)
+        document.pop("receipts", None)
+        document["item_count"] = sum(line.quantity for line in state.lines)
+        document["total_cents"] = state.total_cents
+        await transaction.execute(
+            """
+            INSERT INTO order_summary (
+                order_id, status, revision, change_offset, document
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(order_id) DO UPDATE SET
+                status = excluded.status,
+                revision = excluded.revision,
+                change_offset = excluded.change_offset,
+                document = excluded.document
+            """,
+            (
+                order_id,
+                state.status,
+                change.revision,
+                change.offset,
+                json.dumps(document, separators=(",", ":"), sort_keys=True),
+            ),
+        )
 
-        if self._fail_first_attempt:
-            self._fail_first_attempt = False
-            self.retry_injected = True
-            raise RuntimeError("simulated crash before exactly-once offset commit")
 
-
-class ExternalAuditProjection:
-    def __init__(self, path: Path, *, fail_first_attempt: bool) -> None:
-        self.attempts = 0
-        self.retry_injected = False
+class AuditProjection:
+    def __init__(self, path: Path) -> None:
         self._path = path
-        self._fail_first_attempt = fail_first_attempt
 
     async def handle(self, changes: tuple[DurableStateChange, ...]) -> None:
-        self.attempts += 1
-        await asyncio.to_thread(self._write_idempotently, changes)
-        if self._fail_first_attempt:
-            self._fail_first_attempt = False
-            self.retry_injected = True
-            raise RuntimeError("simulated crash after at-least-once external commit")
+        await asyncio.to_thread(self._write, changes)
 
-    def _write_idempotently(self, changes: tuple[DurableStateChange, ...]) -> None:
+    def _write(self, changes: tuple[DurableStateChange, ...]) -> None:
         codec = OrderCodec()
         rows = []
         for change in changes:
@@ -315,20 +411,20 @@ class ExternalAuditProjection:
                 status = codec.decode(change.manifest, change.payload).status
             rows.append(
                 (
+                    change.persistence_id.entity_id,
                     str(change.operation_id),
                     change.offset,
-                    change.persistence_id.entity_id,
                     change.revision,
                     status,
                     change.committed_at_ns,
                 )
             )
-        with closing(sqlite3.connect(self._path)) as connection:
+        with closing(sqlite3.connect(self._path, timeout=5.0)) as connection:
             with connection:
                 connection.executemany(
                     """
-                    INSERT INTO external_order_audit (
-                        operation_id, change_offset, order_id, revision, status,
+                    INSERT INTO order_audit (
+                        order_id, operation_id, change_offset, revision, status,
                         committed_at_ns
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(order_id, operation_id) DO NOTHING
@@ -337,66 +433,215 @@ class ExternalAuditProjection:
                 )
 
 
-@dataclass(frozen=True, slots=True)
-class DemoResult:
-    order_id: str
-    order_slice: int
-    duplicate_payment_revision: int
-    recovered_revision: int
-    final_revision: int
-    final_status: str
-    item_count: int
-    total_cents: int
-    audit_statuses: tuple[str, ...]
-    audit_entry_count: int
-    outbox_entry_count: int
-    history_entry_count: int
-    exactly_once_retry_observed: bool
-    at_least_once_retry_observed: bool
-    compacted_changes: int
-    compaction_batches: tuple[int, ...]
-    resumed_projection_offset: int
-    tombstone_revision: int
-    baseline_rejection_observed: bool
-    baseline_offset: int
+class OrderRuntime:
+    def __init__(self, data_dir: Path, command_timeout: float = 5.0) -> None:
+        self.data_dir = data_dir
+        self.movie_path = data_dir / "orders.sqlite3"
+        self.audit_path = data_dir / "audit.sqlite3"
+        self.command_timeout = command_timeout
+        self._actors: dict[str, ActorRef[OrderCommand]] = {}
+        self._actors_lock = Lock()
+        self._system: ActorSystem | None = None
+        self._summary = None
+        self._audit = None
+
+    def start(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        _prepare_tables(self.movie_path, self.audit_path)
+        self._system = ActorSystem.create(
+            Behaviors.receive(lambda context, message: Behaviors.same),
+            "durable-order-service",
+            config=Config(
+                {
+                    "movie": {
+                        "persistence": {"sqlite": {"path": str(self.movie_path)}},
+                        "projection": {
+                            "poll-interval": 0.05,
+                            "retry-min-backoff": 0.05,
+                            "retry-max-backoff": 2.0,
+                        },
+                    }
+                }
+            ),
+        )
+        try:
+            projections = PROJECTIONS.get(self._system)
+            audit = AuditProjection(self.audit_path)
+            self._summary = projections.run_exactly_once(
+                ProjectionId("order-summary", "all"),
+                entity_type=ORDER_ENTITY_TYPE,
+                min_slice=0,
+                max_slice=PERSISTENCE_SLICE_COUNT - 1,
+                handler=update_order_summary,
+            )
+            self._audit = projections.run_at_least_once(
+                ProjectionId("order-audit", "all"),
+                entity_type=ORDER_ENTITY_TYPE,
+                min_slice=0,
+                max_slice=PERSISTENCE_SLICE_COUNT - 1,
+                handler=audit.handle,
+            )
+            for handle in (self._summary, self._audit):
+                if not handle.wait_started(10.0):
+                    raise handle.failure or RuntimeError("Projection failed to start")
+        except BaseException:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        if self._system is None:
+            return
+        for handle in (self._summary, self._audit):
+            if handle is not None and handle.is_running:
+                handle.request_stop()
+        self._system.stop(10.0)
+        self._system = None
+
+    def execute(self, order_id: str, command_factory) -> CommandResult:
+        reply: Future[CommandResult] = Future()
+        actor = self._actor_for(order_id)
+        try:
+            actor.tell(command_factory(reply))
+        except MailboxCapacityExceeded as error:
+            raise HTTPException(503, "order mailbox capacity is full") from error
+        try:
+            return reply.result(timeout=self.command_timeout)
+        except TimeoutError as error:
+            reply.cancel()
+            raise HTTPException(
+                504,
+                "command outcome is unknown; retry with the same Idempotency-Key",
+            ) from error
+
+    def get_order(self, order_id: str) -> dict | None:
+        return self._get_order(order_id)
+
+    def list_orders(self) -> list[dict]:
+        return self._list_orders()
+
+    def audit(self, order_id: str) -> list[dict]:
+        return self._audit_rows(order_id)
+
+    def compact(self) -> int:
+        assert self._system is not None
+        return PROJECTIONS.get(self._system).compact_changes().result(
+            timeout=self.command_timeout
+        )
+
+    @property
+    def health(self) -> dict:
+        handles = (self._summary, self._audit)
+        ready = all(
+            handle is not None and handle.is_running and handle.failure is None
+            for handle in handles
+        )
+        return {
+            "status": "ready" if ready else "degraded",
+            "projection_offsets": {
+                str(handle.projection_id): handle.offset
+                for handle in handles
+                if handle is not None
+            },
+        }
+
+    def _actor_for(self, order_id: str) -> ActorRef[OrderCommand]:
+        with self._actors_lock:
+            actor = self._actors.get(order_id)
+            if actor is not None:
+                return actor
+            assert self._system is not None
+            actor_name = f"order-{sha256(order_id.encode()).hexdigest()[:20]}"
+            actor = self._system.spawn(
+                Behaviors.setup(
+                    lambda context: OrderBehavior(context, order_id)
+                ),
+                actor_name,
+            )
+            self._actors[order_id] = actor
+            return actor
+
+    def _get_order(self, order_id: str) -> dict | None:
+        with closing(sqlite3.connect(self.movie_path, timeout=5.0)) as connection:
+            row = connection.execute(
+                """
+                SELECT document, revision, change_offset
+                FROM order_summary
+                WHERE order_id = ?
+                """,
+                (order_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "order_id": order_id,
+            **json.loads(row[0]),
+            "revision": row[1],
+            "change_offset": row[2],
+        }
+
+    def _list_orders(self) -> list[dict]:
+        with closing(sqlite3.connect(self.movie_path, timeout=5.0)) as connection:
+            rows = connection.execute(
+                """
+                SELECT order_id, status, revision, document
+                FROM order_summary
+                ORDER BY order_id
+                LIMIT 100
+                """
+            ).fetchall()
+        return [
+            {
+                "order_id": row[0],
+                "status": row[1],
+                "revision": row[2],
+                "total_cents": json.loads(row[3])["total_cents"],
+            }
+            for row in rows
+        ]
+
+    def _audit_rows(self, order_id: str) -> list[dict]:
+        with closing(sqlite3.connect(self.audit_path, timeout=5.0)) as connection:
+            rows = connection.execute(
+                """
+                SELECT operation_id, revision, status, committed_at_ns
+                FROM order_audit
+                WHERE order_id = ?
+                ORDER BY revision
+                """,
+                (order_id,),
+            ).fetchall()
+        return [
+            {
+                "operation_id": row[0],
+                "revision": row[1],
+                "status": row[2],
+                "committed_at_ns": row[3],
+            }
+            for row in rows
+        ]
 
 
-def _prepare_databases(movie_path: Path, audit_path: Path) -> None:
-    movie_path.parent.mkdir(parents=True, exist_ok=True)
+def _prepare_tables(movie_path: Path, audit_path: Path) -> None:
     with closing(sqlite3.connect(movie_path)) as connection:
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS order_summary (
                 order_id TEXT PRIMARY KEY,
-                customer_id TEXT NOT NULL,
                 status TEXT NOT NULL,
-                item_count INTEGER NOT NULL,
-                total_cents INTEGER NOT NULL,
                 revision INTEGER NOT NULL,
-                tracking_number TEXT
-            );
-            CREATE TABLE IF NOT EXISTS order_projection_history (
-                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                status TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS order_outbox (
-                operation_id TEXT NOT NULL,
-                order_id TEXT NOT NULL,
-                notification_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                PRIMARY KEY (order_id, operation_id)
-            );
+                change_offset INTEGER NOT NULL,
+                document TEXT NOT NULL
+            )
             """
         )
+        connection.commit()
     with closing(sqlite3.connect(audit_path)) as connection:
         connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS external_order_audit (
+            CREATE TABLE IF NOT EXISTS order_audit (
+                order_id TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
                 change_offset INTEGER NOT NULL UNIQUE,
-                order_id TEXT NOT NULL,
                 revision INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 committed_at_ns INTEGER NOT NULL,
@@ -407,386 +652,169 @@ def _prepare_databases(movie_path: Path, audit_path: Path) -> None:
         connection.commit()
 
 
-def _remove_database(path: Path) -> None:
-    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
-        candidate.unlink(missing_ok=True)
+def _runtime(request: Request) -> OrderRuntime:
+    return request.app.state.order_runtime
 
 
-def _create_system(name: str, movie_path: Path) -> ActorSystem:
-    return ActorSystem.create(
-        Behaviors.receive(lambda context, message: Behaviors.same),
-        name,
-        config=Config(
-            {
-                "movie": {
-                    "persistence": {"sqlite": {"path": str(movie_path)}},
-                    "projection": {
-                        "batch-size": 2,
-                        "compaction-batch-size": 2,
-                        "poll-interval": 0.01,
-                        "retry-min-backoff": 0.01,
-                        "retry-max-backoff": 0.05,
-                    },
-                }
-            }
+def _operation_id(value: UUID) -> OperationId:
+    return OperationId(value)
+
+
+def _command_response(result: CommandResult) -> dict:
+    if not result.accepted:
+        raise HTTPException(409, result.error)
+    return {
+        "operation_id": str(result.operation_id),
+        "revision": result.revision,
+        "status": result.status,
+    }
+
+
+def _settings() -> tuple[Path, float]:
+    data_dir = Path(
+        os.environ.get(
+            "MOVIE_ORDER_DATA",
+            str(Path(".movie-example") / "order-service"),
+        )
+    )
+    command_timeout = float(os.environ.get("MOVIE_ORDER_COMMAND_TIMEOUT", "5"))
+    return data_dir, command_timeout
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    data_dir, command_timeout = _settings()
+    runtime = OrderRuntime(data_dir, command_timeout)
+    runtime.start()
+    app.state.order_runtime = runtime
+    try:
+        yield
+    finally:
+        runtime.stop()
+
+
+app = FastAPI(
+    title="Movie Durable Order Service",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+IdempotencyKey = Annotated[UUID, Header(alias="Idempotency-Key")]
+
+
+@app.post("/orders", status_code=202)
+def create_order(
+    request: Request,
+    body: CreateOrderInput,
+    idempotency_key: IdempotencyKey,
+):
+    runtime = _runtime(request)
+    operation_id = _operation_id(idempotency_key)
+    lines = tuple(
+        OrderLine(line.sku, line.quantity, line.unit_price_cents)
+        for line in body.lines
+    )
+    result = runtime.execute(
+        body.order_id,
+        lambda reply: PlaceOrder(
+            body.customer_id,
+            lines,
+            operation_id,
+            reply,
         ),
     )
+    return {
+        "order_id": body.order_id,
+        **_command_response(result),
+    }
 
 
-def _start_projections(
-    system: ActorSystem,
-    audit_path: Path,
-    *,
-    fail_first_attempt: bool,
-) -> tuple:
-    projections = PROJECTIONS.get(system)
-    summary_handler = OrderSummaryProjection(fail_first_attempt=fail_first_attempt)
-    audit_handler = ExternalAuditProjection(
-        audit_path,
-        fail_first_attempt=fail_first_attempt,
+@app.post("/orders/{order_id}/payments", status_code=202)
+def record_payment(
+    order_id: str,
+    request: Request,
+    body: PaymentInput,
+    idempotency_key: IdempotencyKey,
+):
+    operation_id = _operation_id(idempotency_key)
+    result = _runtime(request).execute(
+        order_id,
+        lambda reply: RecordPayment(body.payment_id, operation_id, reply),
     )
-    summary = projections.run_exactly_once(
-        ProjectionId("order-summary", "all"),
-        entity_type=ORDER_ENTITY_TYPE,
-        min_slice=0,
-        max_slice=PERSISTENCE_SLICE_COUNT - 1,
-        handler=summary_handler.handle,
+    return _command_response(result)
+
+
+@app.post("/orders/{order_id}/shipments", status_code=202)
+def ship_order(
+    order_id: str,
+    request: Request,
+    body: ShipmentInput,
+    idempotency_key: IdempotencyKey,
+):
+    operation_id = _operation_id(idempotency_key)
+    result = _runtime(request).execute(
+        order_id,
+        lambda reply: ShipOrder(body.tracking_number, operation_id, reply),
     )
-    audit = projections.run_at_least_once(
-        ProjectionId("order-audit", "all"),
-        entity_type=ORDER_ENTITY_TYPE,
-        min_slice=0,
-        max_slice=PERSISTENCE_SLICE_COUNT - 1,
-        handler=audit_handler.handle,
+    return _command_response(result)
+
+
+@app.delete("/orders/{order_id}", status_code=202)
+def archive_order(
+    order_id: str,
+    request: Request,
+    idempotency_key: IdempotencyKey,
+):
+    operation_id = _operation_id(idempotency_key)
+    result = _runtime(request).execute(
+        order_id,
+        lambda reply: ArchiveOrder(operation_id, reply),
     )
-    for handle in (summary, audit):
-        if not handle.wait_started(5.0):
-            raise handle.failure or TimeoutError(f"Projection {handle.projection_id} did not start")
-    return summary, audit, summary_handler, audit_handler
+    return _command_response(result)
 
 
-def _wait_for_offset(handle, target: int, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while handle.offset < target:
-        if handle.failure is not None:
-            raise handle.failure
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"Projection {handle.projection_id} did not reach {target}")
-        time.sleep(0.01)
+@app.get("/orders/{order_id}")
+def get_order(order_id: str, request: Request):
+    order = _runtime(request).get_order(order_id)
+    if order is None:
+        raise HTTPException(404, "order is not available in the read model")
+    return order
 
 
-def _send_and_wait(actor, command: OrderCommand) -> OrderAck:
-    actor.tell(command)
-    return command.reply_to.get(timeout=5.0)
+@app.get("/orders")
+def list_orders(request: Request):
+    return {"orders": _runtime(request).list_orders()}
 
 
-async def _ignore_changes(changes: tuple[DurableStateChange, ...]) -> None:
-    pass
+@app.get("/orders/{order_id}/audit")
+def order_audit(order_id: str, request: Request):
+    return {"changes": _runtime(request).audit(order_id)}
 
 
-def run_demo(
-    data_dir: Path,
-    *,
-    order_id: str | None = None,
-    reset: bool = False,
-    emit: Callable[[str], None] = print,
-) -> DemoResult:
-    data_dir = Path(data_dir)
-    movie_path = data_dir / "orders.sqlite3"
-    audit_path = data_dir / "external-audit.sqlite3"
-    if reset:
-        _remove_database(movie_path)
-        _remove_database(audit_path)
-    _prepare_databases(movie_path, audit_path)
+@app.get("/health")
+def health(request: Request):
+    return _runtime(request).health
 
-    order_id = order_id or f"order-{uuid4().hex[:8]}"
-    abandoned_order_id = f"{order_id}-abandoned"
-    order_replies: Queue[OrderAck] = Queue()
-    abandoned_replies: Queue[OrderAck] = Queue()
-    phase_one_summary_handler = None
-    phase_one_audit_handler = None
-    phase_one_summary_offset = -1
-    phase_one_audit_offset = -1
 
-    first_system = _create_system("durable-orders-phase-one", movie_path)
-    first_handles = []
-    try:
-        summary, audit, phase_one_summary_handler, phase_one_audit_handler = (
-            _start_projections(first_system, audit_path, fail_first_attempt=True)
-        )
-        first_handles.extend((summary, audit))
-        summary_start = summary.offset
-        audit_start = audit.offset
-
-        order_recovered: Queue[OrderRecovered] = Queue()
-        order = first_system.spawn(
-            Behaviors.setup(
-                lambda context: OrderBehavior(context, order_id, order_recovered)
-            ),
-            "active-order",
-        )
-        assert order_recovered.get(timeout=5.0).revision == 0
-
-        lines = (
-            OrderLine("mechanical-keyboard", 1, 12_500),
-            OrderLine("usb-c-cable", 2, 1_800),
-        )
-        # Operation Identity is scoped by Persistence Identity, not globally.
-        shared_place_operation_id = OperationId.random()
-        place = PlaceOrder(
-            "customer-42",
-            lines,
-            shared_place_operation_id,
-            order_replies,
-        )
-        assert _send_and_wait(order, place).revision == 1
-
-        payment_operation_id = OperationId.random()
-        lost_payment_replies: Queue[OrderAck] = Queue()
-        order.tell(
-            RecordPayment(
-                "payment-9001",
-                payment_operation_id,
-                lost_payment_replies,
-            )
-        )
-        duplicate_payment = _send_and_wait(
-            order,
-            RecordPayment(
-                "payment-9001",
-                payment_operation_id,
-                order_replies,
-            ),
-        )
-
-        abandoned_recovered: Queue[OrderRecovered] = Queue()
-        abandoned = first_system.spawn(
-            Behaviors.setup(
-                lambda context: OrderBehavior(
-                    context,
-                    abandoned_order_id,
-                    abandoned_recovered,
-                )
-            ),
-            "abandoned-order",
-        )
-        assert abandoned_recovered.get(timeout=5.0).revision == 0
-        abandoned_place = PlaceOrder(
-            "customer-99",
-            (OrderLine("reserved-item", 1, 2_000),),
-            shared_place_operation_id,
-            abandoned_replies,
-        )
-        assert _send_and_wait(abandoned, abandoned_place).revision == 1
-        archive = ArchiveOrder(OperationId.random(), abandoned_replies)
-        assert _send_and_wait(abandoned, archive).revision == 2
-
-        _wait_for_offset(summary, summary_start + 4)
-        _wait_for_offset(audit, audit_start + 4)
-        phase_one_summary_offset = summary.offset
-        phase_one_audit_offset = audit.offset
-    finally:
-        for handle in first_handles:
-            if handle.is_running:
-                handle.request_stop()
-        first_system.stop(10.0)
-
-    second_system = _create_system("durable-orders-phase-two", movie_path)
-    second_handles = []
-    compacted_changes = 0
-    compaction_batches = []
-    baseline_rejection_observed = False
-    try:
-        summary, audit, _, _ = _start_projections(
-            second_system,
-            audit_path,
-            fail_first_attempt=False,
-        )
-        second_handles.extend((summary, audit))
-        summary_start = summary.offset
-        audit_start = audit.offset
-        if (
-            summary_start != phase_one_summary_offset
-            or audit_start != phase_one_audit_offset
-        ):
-            raise RuntimeError("the Projections did not resume from their stored offsets")
-
-        recovered_states: Queue[OrderRecovered] = Queue()
-        recovered_order = second_system.spawn(
-            Behaviors.setup(
-                lambda context: OrderBehavior(context, order_id, recovered_states)
-            ),
-            "recovered-order",
-        )
-        recovered = recovered_states.get(timeout=5.0)
-        if recovered.state.status != "paid" or recovered.revision != 2:
-            raise RuntimeError("the order did not recover its paid state")
-        tombstone = DURABLE_STATE.get(second_system).store.load(
-            PersistenceId(ORDER_ENTITY_TYPE, abandoned_order_id)
-        ).result(5.0)
-        if tombstone is None or not tombstone.deleted or tombstone.revision != 2:
-            raise RuntimeError("the abandoned order did not retain its tombstone")
-
-        shipped = _send_and_wait(
-            recovered_order,
-            ShipOrder("TRACK-123", OperationId.random(), order_replies),
-        )
-        if shipped.revision != 3:
-            raise RuntimeError("the shipped order has an unexpected Revision")
-        _wait_for_offset(summary, summary_start + 1)
-        _wait_for_offset(audit, audit_start + 1)
-        baseline_offset = min(summary.offset, audit.offset)
-
-        summary.stop(5.0)
-        audit.stop(5.0)
-        while True:
-            compacted = PROJECTIONS.get(second_system).compact_changes().result(5.0)
-            if compacted == 0:
-                break
-            compacted_changes += compacted
-            compaction_batches.append(compacted)
-
-        missing_baseline = PROJECTIONS.get(second_system).run_at_least_once(
-            ProjectionId("order-baseline-missing", order_id),
-            entity_type=ORDER_ENTITY_TYPE,
-            min_slice=0,
-            max_slice=PERSISTENCE_SLICE_COUNT - 1,
-            handler=_ignore_changes,
-        )
-        second_handles.append(missing_baseline)
-        if not missing_baseline.wait_stopped(5.0):
-            raise TimeoutError("missing-baseline Projection did not stop")
-        if not isinstance(missing_baseline.failure, ProjectionBaselineError):
-            raise RuntimeError("compacted history did not require an explicit baseline")
-        baseline_rejection_observed = True
-
-        baseline_id = ProjectionId("order-baseline-check", order_id)
-        baseline = PROJECTIONS.get(second_system).run_at_least_once(
-            baseline_id,
-            entity_type=ORDER_ENTITY_TYPE,
-            min_slice=0,
-            max_slice=PERSISTENCE_SLICE_COUNT - 1,
-            handler=_ignore_changes,
-            initial_offset=baseline_offset,
-        )
-        second_handles.append(baseline)
-        if not baseline.wait_started(5.0):
-            raise baseline.failure or TimeoutError("baseline Projection did not start")
-        baseline.stop(5.0)
-        if not PROJECTIONS.get(second_system).retire(baseline_id).result(5.0):
-            raise RuntimeError("baseline Projection was not retired")
-    finally:
-        for handle in second_handles:
-            if handle.is_running:
-                handle.request_stop()
-        second_system.stop(10.0)
-
-    with closing(sqlite3.connect(movie_path)) as connection:
-        summary_row = connection.execute(
-            """
-            SELECT status, item_count, total_cents, revision
-            FROM order_summary
-            WHERE order_id = ?
-            """,
-            (order_id,),
-        ).fetchone()
-        abandoned_summary = connection.execute(
-            "SELECT 1 FROM order_summary WHERE order_id = ?",
-            (abandoned_order_id,),
-        ).fetchone()
-        outbox_entry_count = connection.execute(
-            "SELECT count(*) FROM order_outbox WHERE order_id IN (?, ?)",
-            (order_id, abandoned_order_id),
-        ).fetchone()[0]
-        history_entry_count = connection.execute(
-            "SELECT count(*) FROM order_projection_history WHERE order_id IN (?, ?)",
-            (order_id, abandoned_order_id),
-        ).fetchone()[0]
-    if summary_row is None or abandoned_summary is not None:
-        raise RuntimeError("the exactly-once order summary is inconsistent")
-
-    with closing(sqlite3.connect(audit_path)) as connection:
-        audit_statuses = tuple(
-            row[0]
-            for row in connection.execute(
-                """
-                SELECT status FROM external_order_audit
-                WHERE order_id = ?
-                ORDER BY revision
-                """,
-                (order_id,),
-            )
-        )
-        audit_entry_count = connection.execute(
-            "SELECT count(*) FROM external_order_audit WHERE order_id IN (?, ?)",
-            (order_id, abandoned_order_id),
-        ).fetchone()[0]
-
-    status, item_count, total_cents, final_revision = summary_row
-    assert phase_one_summary_handler is not None
-    assert phase_one_audit_handler is not None
-    result = DemoResult(
-        order_id=order_id,
-        order_slice=persistence_slice(PersistenceId(ORDER_ENTITY_TYPE, order_id)),
-        duplicate_payment_revision=duplicate_payment.revision,
-        recovered_revision=recovered.revision,
-        final_revision=final_revision,
-        final_status=status,
-        item_count=item_count,
-        total_cents=total_cents,
-        audit_statuses=audit_statuses,
-        audit_entry_count=audit_entry_count,
-        outbox_entry_count=outbox_entry_count,
-        history_entry_count=history_entry_count,
-        exactly_once_retry_observed=phase_one_summary_handler.retry_injected,
-        at_least_once_retry_observed=phase_one_audit_handler.retry_injected,
-        compacted_changes=compacted_changes,
-        compaction_batches=tuple(compaction_batches),
-        resumed_projection_offset=phase_one_summary_offset,
-        tombstone_revision=tombstone.revision,
-        baseline_rejection_observed=baseline_rejection_observed,
-        baseline_offset=baseline_offset,
-    )
-    emit(
-        f"{result.order_id} recovered at revision {result.recovered_revision}, "
-        f"then reached {result.final_status} at revision {result.final_revision}."
-    )
-    emit(
-        f"Summary: {result.item_count} items, ${result.total_cents / 100:.2f}; "
-        f"audit={result.audit_entry_count}, outbox={result.outbox_entry_count}, "
-        f"history={result.history_entry_count}."
-    )
-    emit(
-        "Both retry paths were observed without duplicate effects; "
-        f"compacted {result.compacted_changes} changes through offset "
-        f"{result.baseline_offset}."
-    )
-    return result
+@app.post("/admin/compact")
+def compact_change_feed(request: Request):
+    return {"deleted_changes": _runtime(request).compact()}
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Run the Movie durable order example")
+    parser = argparse.ArgumentParser(description="Run the durable order FastAPI app")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8080)
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path(".movie-example") / "durable-orders",
-        help="directory for the Movie and external audit SQLite databases",
-    )
-    parser.add_argument(
-        "--order-id",
-        help="fixed order ID; use --reset when repeating the same ID",
-    )
-    parser.add_argument(
-        "--reset",
-        action="store_true",
-        help="delete the example databases before running",
+        default=Path(".movie-example") / "order-service",
     )
     arguments = parser.parse_args(argv)
-    run_demo(
-        arguments.data_dir,
-        order_id=arguments.order_id,
-        reset=arguments.reset,
-    )
+    os.environ["MOVIE_ORDER_DATA"] = str(arguments.data_dir)
+
+    import uvicorn
+
+    uvicorn.run(app, host=arguments.host, port=arguments.port)
 
 
 if __name__ == "__main__":
