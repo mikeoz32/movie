@@ -153,6 +153,25 @@ def test_inline_failure_recovery_uses_iterative_trampoline() -> None:
     assert mailbox._scheduled is False
 
 
+def test_raw_batch_failure_releases_in_flight_capacity() -> None:
+    class RawFailingActor(RecordingActor):
+        def invoke_batch(self, messages, *, system: bool) -> list:
+            raise KeyboardInterrupt("boom")
+
+    dispatcher = ManualDispatcher()
+    mailbox = DefaultMailbox(
+        dispatcher,
+        RawFailingActor(),
+        Config({"capacity": 1, "throughput": 1}),
+    )
+    mailbox.send("first")
+
+    with pytest.raises(KeyboardInterrupt, match="boom"):
+        dispatcher.run_all()
+
+    assert mailbox.try_send("second") is MailboxAdmissionResult.ACCEPTED
+
+
 def test_system_messages_are_prioritized_and_batches_are_bounded() -> None:
     actor = RecordingActor()
     dispatcher = ManualDispatcher()
@@ -225,6 +244,43 @@ def test_concurrent_admission_never_exceeds_mailbox_capacity() -> None:
     assert admitted.count(MailboxAdmissionResult.ACCEPTED) == capacity
     assert admitted.count(MailboxAdmissionResult.FULL) == attempts - capacity
     assert len(mailbox.stop_user_messages()) == capacity
+
+
+def test_extracted_batch_remains_counted_toward_capacity() -> None:
+    class SuspendingActor(RecordingActor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.suspended = False
+            self.admissions = []
+
+        def invoke_batch(self, messages, *, system: bool) -> list:
+            self.messages.append(("user", messages[0]))
+            self.admissions.extend(
+                [mailbox.try_send("new-1"), mailbox.try_send("new-2")]
+            )
+            self.suspended = True
+            return messages[1:]
+
+        def can_process_user_messages(self) -> bool:
+            return not self.suspended
+
+    actor = SuspendingActor()
+    dispatcher = ManualDispatcher()
+    mailbox = DefaultMailbox(
+        dispatcher,
+        actor,
+        Config({"capacity": 2, "throughput": 2}),
+    )
+
+    mailbox.send("first")
+    mailbox.send("second")
+    dispatcher.run_all()
+
+    assert actor.admissions == [
+        MailboxAdmissionResult.FULL,
+        MailboxAdmissionResult.FULL,
+    ]
+    assert mailbox.stop_user_messages() == ["second"]
 
 
 def test_dispatcher_rejection_rolls_back_message() -> None:

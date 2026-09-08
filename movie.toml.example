@@ -27,6 +27,29 @@ startup-timeout = 10
 command-capacity = 1024
 event-loop-count = 1
 
+[movie.persistence]
+startup-timeout = 10
+operation-timeout = 5
+recovery-timeout = 5
+operation-capacity = 1024
+pending-byte-capacity = 67108864
+max-state-bytes = 4194304
+
+[movie.persistence.sqlite]
+path = "data/movie.sqlite3"
+
+[movie.projection]
+runner-capacity = 32
+batch-size = 100
+batch-byte-capacity = 16777216
+pending-byte-capacity = 67108864
+poll-interval = 0.1
+retry-min-backoff = 0.1
+retry-max-backoff = 5
+handler-timeout = 30
+scan-limit = 10000
+compaction-batch-size = 1000
+
 [movie.io.tcp]
 operation-limit = 1024
 write-message-limit = 1024

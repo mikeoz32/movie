@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+.movie-example/
 
 # Virtual environments
 .venv

@@ -1,12 +1,12 @@
 # Movie
 
-Movie is a typed actor runtime for local and remote actor systems on free-threaded CPython 3.14t. It provides hierarchical actors, supervision, bounded mailboxes, configurable dispatchers, lifecycle signals, direct TCP remoting, optional volatile cluster membership, and a small backpressured streams DSL.
+Movie is a typed actor runtime for local and remote actor systems on free-threaded CPython 3.14t. It provides hierarchical actors, supervision, bounded mailboxes, configurable dispatchers, lifecycle signals, optional SQLite durable state and projections, direct TCP remoting, optional volatile cluster membership, and a small backpressured streams DSL.
 
 ## Production Scope
 
-Actor state, mailboxes, stream state, cluster membership, and messages are volatile and are lost when the process exits. Remoting provides direct, allowlisted actor-system associations; the optional cluster layer adds coordinated membership but not durable delivery, persistence, discovery, authentication, coordinator failover, or an HTTP health endpoint.
+Actor state, mailboxes, stream state, cluster membership, and messages are volatile and are lost when the process exits unless an application explicitly uses `DurableStateBehavior` for selected state. Durable State does not persist mailboxes or turn message delivery into a durable acknowledgement. Remoting provides direct, allowlisted actor-system associations; the optional cluster layer adds coordinated membership but not durable delivery, discovery, authentication, coordinator failover, or an HTTP health endpoint.
 
-The remoting v1 contract is documented in [`docs/remoting-v1.md`](docs/remoting-v1.md), and the separate cluster contract is documented in [`docs/cluster-v1.md`](docs/cluster-v1.md). Remoting specifies direct TCP associations behind a transport abstraction, at-most-once delivery, explicit serializers, and a trusted-network boundary. See [`CONTEXT.md`](CONTEXT.md) for canonical terminology and the ADRs under [`docs/adr`](docs/adr).
+The separate contracts are documented in [`docs/persistence-v1.md`](docs/persistence-v1.md), [`docs/projections-v1.md`](docs/projections-v1.md), [`docs/remoting-v1.md`](docs/remoting-v1.md), and [`docs/cluster-v1.md`](docs/cluster-v1.md). Remoting specifies direct TCP associations behind a transport abstraction, at-most-once delivery, explicit serializers, and a trusted-network boundary. See [`CONTEXT.md`](CONTEXT.md) for canonical terminology and the ADRs under [`docs/adr`](docs/adr).
 
 The runtime guarantees:
 
@@ -27,6 +27,12 @@ The runtime guarantees:
 
 ```console
 uv add movie-actor-runtime
+```
+
+SQLite Durable State uses an optional asynchronous driver:
+
+```console
+uv add "movie-actor-runtime[persistence-sqlite]"
 ```
 
 For development:
@@ -190,6 +196,101 @@ After an operational decision that an exact unreachable incarnation must not ret
 
 Cluster control records use a built-in serializer composed with the application registry. The seed, `heartbeat_interval`, `unreachable_timeout`, `member_limit`, `retired_identity_limit`, and `serializer_id` must match on every participant and are verified during join; the serializer ID must also be collision-free in each application registry. Cluster v1 has no dynamic endpoint admission, gossip, coordinator election or failover, automatic downing, split-brain resolver, role-based placement, singleton, sharding, or durable membership.
 
+## Durable State
+
+`DurableStateBehavior` stores one latest revisioned state or tombstone for an application-defined `PersistenceId`. Configure an explicit SQLite path to start the `DURABLE_STATE` extension before the root behavior; the extension obtains a stable worker from `ASYNCIO_IO`, and no potentially blocking SQLite operation runs on an actor dispatcher or asyncio event-loop thread.
+
+```python
+import json
+from dataclasses import dataclass
+
+from movie.actor import ActorSystem, Behaviors
+from movie.config import Config
+from movie.persistence import (
+    DurableStateBehavior,
+    EncodedState,
+    OperationId,
+    PersistenceId,
+)
+
+@dataclass(frozen=True)
+class CounterState:
+    value: int = 0
+
+class CounterCodec:
+    def encode(self, state):
+        return EncodedState("counter/v1", json.dumps(state.value).encode("ascii"))
+
+    def decode(self, manifest, payload):
+        if manifest != "counter/v1":
+            raise ValueError("unsupported state manifest")
+        return CounterState(json.loads(payload))
+
+class Counter(DurableStateBehavior):
+    def empty_state(self):
+        return CounterState()
+
+    def handle_command(self, state, command, context):
+        return self.persist(
+            CounterState(state.value + command.amount),
+            command.operation_id,
+        )
+
+config = Config({
+    "movie": {"persistence": {"sqlite": {"path": "data/movie.sqlite3"}}}
+})
+system = ActorSystem.create(Behaviors.receive(lambda context, message: Behaviors.same), "app", config=config)
+counter = system.spawn(
+    Behaviors.setup(
+        lambda context: Counter(context, PersistenceId("counter", "one"), CounterCodec())
+    ),
+    "counter-one",
+)
+```
+
+Recovery runs asynchronously and suspends only user-message processing, leaving commands in the existing bounded mailbox. `persist`, `delete`, `none`, `stop`, `then_run`, and `then_stop` effects preserve commit-before-state semantics. Every mutation requires an `OperationId`; a successful nonduplicate mutation advances an optimistic Revision. See [`docs/persistence-v1.md`](docs/persistence-v1.md) for timeout, duplicate, schema, shutdown, and retry semantics.
+
+## Durable State Projections
+
+Every nonduplicate Durable State mutation also appends an immutable change in the same SQLite transaction. A Projection consumes bounded batches from this Change Feed and resumes from its stored `ProjectionId` offset:
+
+```python
+from movie.projection import PROJECTIONS, ProjectionId
+
+async def update_index(changes):
+    for change in changes:
+        await search_index.replace(change.persistence_id.entity_id, change.payload)
+
+projection = PROJECTIONS.get(system).run_at_least_once(
+    ProjectionId("counter-search", "all"),
+    entity_type="counter",
+    min_slice=0,
+    max_slice=1023,
+    handler=update_index,
+)
+```
+
+At-least-once handlers may receive the same batch again after failure and must be idempotent. `run_exactly_once` instead gives the handler a restricted SQLite transaction so read-model writes and the Projection Offset commit atomically in the persistence database. It does not make external effects exactly-once. See [`docs/projections-v1.md`](docs/projections-v1.md) for source, slice, retry, baseline, compaction, ownership, and shutdown semantics.
+
+### Complete Durable Order Example
+
+[`examples/durable_orders.py`](examples/durable_orders.py) is an executable order-processing application that combines the persistence and Projection APIs:
+
+- a `DurableStateBehavior` owns each order and recovers it after an Actor System restart;
+- a payment is retried with the same `OperationId` after its acknowledgement is deliberately ignored, without adding a Revision or Change Feed entry;
+- a SQLite exactly-once Projection updates an order summary, append-only history, and transactional notification outbox;
+- an at-least-once Projection writes to a separate audit database with `(PersistenceId, OperationId)` as its idempotency key;
+- both handlers inject one retryable failure to demonstrate replay without duplicate effects;
+- an abandoned order becomes a retained tombstone, and the app performs bounded compaction, demonstrates baseline-required rejection, then uses explicit-baseline registration and retirement.
+
+Run it from a checkout with the SQLite extra installed:
+
+```console
+uv run --python 3.14t python -m examples.durable_orders --reset
+```
+
+The default databases are written under `.movie-example/durable-orders`. Omit `--reset` to retain prior state and use a newly generated Order Identity, or combine `--order-id` with `--reset` for a repeatable run.
+
 ## Streams Example
 
 ```python
@@ -254,7 +355,7 @@ Movie optionally reads `movie.toml` from the current working directory by defaul
 
 See [`movie.toml.example`](movie.toml.example) for all production-relevant settings.
 
-Remoting topology and cluster membership are configured programmatically through immutable `RemotingConfig` and `ClusterConfig` values rather than `movie.toml`.
+Remoting topology and cluster membership are configured programmatically through immutable `RemotingConfig` and `ClusterConfig` values rather than `movie.toml`. SQLite Durable State and Projections use the operational settings under `movie.persistence` and `movie.projection`.
 
 Key capacity behavior:
 
@@ -262,6 +363,8 @@ Key capacity behavior:
 - A full actor stash raises `RuntimeError`.
 - `throughput` normally yields a hot mailbox to other dispatcher work. During dispatcher shutdown, the current worker keeps draining accepted messages if handoff is rejected.
 - Streams require the default mailbox capacity to be at least 32 and fail materialization otherwise.
+- Durable State rejects work when its operation or pending-byte capacity is full; it never waits for storage capacity on an actor dispatcher.
+- Projections bound active runners and retained batch bytes, and share Durable State operation capacity.
 
 Lifecycle messages use dedicated mailbox and priority dispatcher queues. `max-actors` and `system-queue-capacity` both default to 100,000, ensuring one reserved lifecycle activation per actor. Ordinary activation capacity is configured independently with `queue-capacity`.
 

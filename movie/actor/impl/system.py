@@ -380,6 +380,13 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         self._rollback_started = Event()
         self._callback_shutdown_started = Event()
         self._callback_state = local()
+        self._durable_state_configured = (
+            self._config.get("movie.persistence.sqlite.path") is not None
+        )
+        if self._durable_state_configured:
+            from movie.persistence import DURABLE_STATE
+
+            self._extensions.configure(DURABLE_STATE)
         if self._remoting_config is not None:
             self._extensions.configure(REMOTING)
         if self._cluster_config is not None:
@@ -461,6 +468,10 @@ class ActorSystemImpl(InternalActorSystem[MessageType]):
         try:
             self._actor_registry.start()
             self._extensions.activate()
+            if self._durable_state_configured:
+                from movie.persistence import DURABLE_STATE
+
+                DURABLE_STATE.get(self)
             self._root_ref = self.spawn(self._root_behavior, self._name)
             context = self.get_context(self._root_ref)
             startup_timeout = self._startup_timeout

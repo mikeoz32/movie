@@ -1,4 +1,4 @@
-from movie.actor.context import ActorContext
+from movie.actor.context import InternalActorContext
 from movie.config import Config
 from movie.dispatch.dispatcher import Dispatcher
 from movie.mailbox.mailbox import Mailbox
@@ -21,7 +21,11 @@ class MailboxManager:
         )
 
     def create_mailbox(
-        self, dispatcher: Dispatcher, actor: ActorContext, *, mailbox: str = "default"
+        self,
+        dispatcher: Dispatcher,
+        actor: InternalActorContext,
+        *,
+        mailbox: str = "default",
     ) -> Mailbox:
         mailbox_config = self._config.get_config(mailbox)
         if mailbox_config is None:
@@ -43,4 +47,8 @@ class MailboxManager:
             )
         ):
             raise TypeError(f"Configured mailbox '{mailbox}' does not implement Mailbox")
+        if type(getattr(instance, "supports_user_suspension", None)) is not bool:
+            raise TypeError(
+                f"Configured mailbox '{mailbox}' must declare user-message suspension support"
+            )
         return instance

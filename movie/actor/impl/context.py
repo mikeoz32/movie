@@ -80,6 +80,7 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
         if self._stash_capacity is None or self._stash_capacity <= 0:
             raise ValueError("Actor stash capacity must be positive")
         self._state = ActorState.NEW
+        self._user_messages_suspended = False
         self._restart_pending = False
         self._started = Event()
         self._started_future = ref.started_future
@@ -234,6 +235,8 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
             self._complete_restart()
 
     def _complete_restart(self) -> None:
+        with self._state_lock:
+            self._user_messages_suspended = False
         self._behavior = self._initial_behavior
         try:
             self.materialize_behaviour()
@@ -323,6 +326,24 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
             mailbox = self._mailbox
         if mailbox is not None:
             mailbox.sendSystem(message)
+
+    def enqueue_control(self, message: ActorSystem.SystemMessage) -> None:
+        self.tell_system(message)
+
+    def suspend_user_messages(self) -> None:
+        with self._state_lock:
+            mailbox = self._mailbox
+            if mailbox is not None and getattr(
+                mailbox, "supports_user_suspension", False
+            ) is not True:
+                raise RuntimeError(
+                    "Configured mailbox does not support user-message suspension"
+                )
+            self._user_messages_suspended = True
+
+    def resume_user_messages(self) -> None:
+        with self._state_lock:
+            self._user_messages_suspended = False
 
     def send(self, message: MessageType) -> None:
         with self._state_lock:
@@ -415,6 +436,8 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
             ):
                 self._stash_locked(message)
                 return
+            if self._user_messages_suspended:
+                raise RuntimeError("Mailbox invoked a suspended user message")
         self.on_message(message)
 
     def invoke_system(self, message: ActorSystem.SystemMessage) -> None:
@@ -460,6 +483,9 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
                         self._begin_restart()
                 case ActorSystem.Failed():
                     self.on_signal(message)
+                case ActorSystem.ControlMessage() as control:
+                    if control.applies_to(self._behavior):
+                        control.deliver(self._behavior, self)
                 case _:
                     self.on_signal(message)
         except Exception as error:
@@ -470,6 +496,11 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
         try:
             invoke = self._invoke_system if system else self._invoke
             for index, message in enumerate(messages):
+                if not system and not self.can_process_user_messages():
+                    state = self.state
+                    if state in (ActorState.STARTING, ActorState.RUNNING, ActorState.FAILED):
+                        return messages[index:]
+                    return []
                 try:
                     invoke(message)
                 except BaseException as error:
@@ -484,8 +515,9 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
                     raise ActorBatchFailed(
                         error, messages[index + 1 :], system=system
                     ) from error
-                if not system and self.state is not ActorState.RUNNING:
-                    if self.state in (ActorState.STARTING, ActorState.FAILED):
+                if not system and not self.can_process_user_messages():
+                    state = self.state
+                    if state in (ActorState.STARTING, ActorState.RUNNING, ActorState.FAILED):
                         return messages[index + 1 :]
                     return []
             return []
@@ -493,7 +525,11 @@ class LocalActorContext(ChildrenMixin, InternalActorContext[MessageType]):
             self._system._exit_actor_callback()
 
     def can_process_user_messages(self) -> bool:
-        return self.state is ActorState.RUNNING
+        with self._state_lock:
+            return (
+                self._state is ActorState.RUNNING
+                and not self._user_messages_suspended
+            )
 
     def spawn(self, behavior: AbstractBehavior, name: str) -> ActorRef:
         """

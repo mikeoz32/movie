@@ -107,3 +107,47 @@ _Avoid_: Actor system shutdown, durable acknowledgement
 **Cluster Membership Event**:
 A volatile local notification about a membership or reachability transition. Its bounded event window is not a durable event log.
 _Avoid_: Remoting health event, consensus result
+
+**Persistence Identity**:
+A stable application-defined identity for one logical durable state, independent of Actor Identity, Actor Path, Actor System, and Actor System Incarnation.
+_Avoid_: Actor identity, actor path, database key
+
+**Operation Identity**:
+A stable token for one intended durable-state mutation within one Persistence Identity. Reusing it distinguishes an uncertain retry from a new mutation.
+_Avoid_: Delivery attempt, actor message ID, transaction ID
+
+**Durable State**:
+The latest successfully committed application state or tombstone for one Persistence Identity and Revision.
+_Avoid_: Actor state, event journal, durable mailbox
+
+**Revision**:
+A monotonically increasing storage concurrency coordinate for one Persistence Identity. It is not a domain version or evidence that an actor processed a message.
+_Avoid_: Schema version, sequence number, acknowledgement
+
+**Tombstone**:
+A durable deleted-state marker that preserves the current Revision and Operation Identity history.
+_Avoid_: Missing row, physical purge
+
+**Recovery**:
+The attempt to load one Durable State before its behavior processes user commands. Recovery does not restore volatile mailbox contents.
+_Avoid_: Actor restart, message replay, cluster rejoin
+
+**Durable State Change**:
+An immutable committed state snapshot or tombstone appended for one nonduplicate Durable State mutation.
+_Avoid_: Domain event, actor message, current durable state
+
+**Projection**:
+A resumable asynchronous consumer that transforms ordered Durable State Changes into an application read model or external side effect.
+_Avoid_: Actor, query, event handler
+
+**Projection Identity**:
+A stable application-defined identity for one logical Projection checkpoint and source definition.
+_Avoid_: Persistence identity, projection process, handler name alone
+
+**Projection Offset**:
+A monotonically increasing change-feed position stored for one Projection Identity. It records source progress, not successful processing by another system.
+_Avoid_: Revision, operation identity, delivery acknowledgement
+
+**Change Feed**:
+The ordered retained sequence of Durable State Changes from which Projections resume after a Projection Offset.
+_Avoid_: Durable State table, actor mailbox, event journal

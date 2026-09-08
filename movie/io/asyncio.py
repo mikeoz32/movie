@@ -320,11 +320,9 @@ class AsyncioIOExtension:
                 task = loop.create_task(coroutine)
             except BaseException as error:
                 coroutine.close()
-                try:
-                    if completed.set_running_or_notify_cancel():
-                        completed.set_exception(error)
-                finally:
-                    self._release_command(worker)
+                self._release_command(worker)
+                if completed.set_running_or_notify_cancel():
+                    completed.set_exception(error)
                 return
 
             def cancel_task(result: Future[T]) -> None:
@@ -335,17 +333,17 @@ class AsyncioIOExtension:
                         pass
 
             def complete(task: asyncio.Task[T]) -> None:
-                try:
-                    if task.cancelled():
-                        completed.cancel()
-                    elif completed.set_running_or_notify_cancel():
-                        error = task.exception()
-                        if error is None:
-                            completed.set_result(task.result())
-                        else:
-                            completed.set_exception(error)
-                finally:
-                    self._release_command(worker)
+                cancelled = task.cancelled()
+                error = None if cancelled else task.exception()
+                result = None if cancelled or error is not None else task.result()
+                self._release_command(worker)
+                if cancelled:
+                    completed.cancel()
+                elif completed.set_running_or_notify_cancel():
+                    if error is None:
+                        completed.set_result(result)
+                    else:
+                        completed.set_exception(error)
 
             completed.add_done_callback(cancel_task)
             task.add_done_callback(complete)
@@ -374,11 +372,14 @@ class AsyncioIOExtension:
             try:
                 callback(*args)
             except BaseException as error:
-                completed.set_exception(error)
+                result_error = error
             else:
+                result_error = None
+            self._release_command(worker)
+            if result_error is None:
                 completed.set_result(None)
-            finally:
-                self._release_command(worker)
+            else:
+                completed.set_exception(result_error)
 
         try:
             loop.call_soon_threadsafe(invoke)

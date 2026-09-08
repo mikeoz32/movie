@@ -1,7 +1,7 @@
 from collections import deque
 from threading import Lock
 
-from movie.actor.context import ActorBatchFailed, ActorContext
+from movie.actor.context import ActorBatchFailed, InternalActorContext
 from movie.config import Config
 from movie.dispatch.dispatcher import Dispatcher
 from movie.mailbox.mailbox import (
@@ -21,10 +21,12 @@ class _Entry:
 class DefaultMailbox(Mailbox):
     """Serializes one actor's user and lifecycle messages."""
 
+    supports_user_suspension = True
+
     def __init__(
         self,
         dispatcher: Dispatcher,
-        actor: ActorContext,
+        actor: InternalActorContext,
         config: Config | None = None,
     ) -> None:
         config = config or Config({})
@@ -39,6 +41,7 @@ class DefaultMailbox(Mailbox):
         self._throughput = throughput
         self._messages = deque()
         self._system_messages = deque()
+        self._in_flight_user_messages = 0
         self._lock = Lock()
         self._scheduled = False
         self._running = False
@@ -68,7 +71,9 @@ class DefaultMailbox(Mailbox):
         with self._lock:
             if self._closed or (user_message and not self._accepting_user_messages):
                 return MailboxAdmissionResult.STOPPING
-            if user_message and len(self._messages) >= self._capacity:
+            if user_message and (
+                len(self._messages) + self._in_flight_user_messages >= self._capacity
+            ):
                 if report_full:
                     return MailboxAdmissionResult.FULL
                 raise MailboxCapacityExceeded("User mailbox is full")
@@ -114,6 +119,7 @@ class DefaultMailbox(Mailbox):
             self._closed = True
             self._messages.clear()
             self._system_messages.clear()
+            self._in_flight_user_messages = 0
 
     def stop_user_messages(self) -> list:
         with self._lock:
@@ -141,6 +147,8 @@ class DefaultMailbox(Mailbox):
                 if pending_error is None:
                     pending_error = failure.error
             except BaseException as error:
+                with self._lock:
+                    self._in_flight_user_messages = 0
                 self._recover_after_failure()
                 if pending_error is None:
                     pending_error = error
@@ -176,6 +184,8 @@ class DefaultMailbox(Mailbox):
                     item.message if isinstance(item := source.popleft(), _Entry) else item
                     for _ in range(min(self._throughput, len(source)))
                 ]
+                if not system_batch:
+                    self._in_flight_user_messages += len(batch)
 
             remaining = self._actor.invoke_batch(batch, system=system_batch)
             self._restore_batch(remaining, system=system_batch)
@@ -206,9 +216,11 @@ class DefaultMailbox(Mailbox):
                     return
 
     def _restore_batch(self, messages: list, *, system: bool = False) -> None:
-        if not messages:
-            return
         with self._lock:
+            if not system:
+                self._in_flight_user_messages = 0
+            if self._closed or not messages:
+                return
             target = self._system_messages if system else self._messages
             target.extendleft(reversed(messages))
 

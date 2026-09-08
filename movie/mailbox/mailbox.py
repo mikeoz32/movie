@@ -13,6 +13,10 @@ class MailboxAdmissionResult(Enum):
 
 
 class Mailbox(Protocol):
+    """Mailbox implementations must honor actor user-message suspension."""
+
+    supports_user_suspension: bool
+
     def send(self, message) -> None: ...
     def try_send(self, message) -> MailboxAdmissionResult: ...
     def sendSystem(self, message) -> None: ...

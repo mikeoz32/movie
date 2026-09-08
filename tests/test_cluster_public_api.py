@@ -233,6 +233,7 @@ def test_cluster_serializer_composes_with_application_serializers() -> None:
         SeedContact("application-seed", seed_endpoint),
         heartbeat_interval=0.02,
         unreachable_timeout=0.15,
+        reassociation_timeout=1.0,
         join_timeout=2.0,
     )
     delivered = Event()

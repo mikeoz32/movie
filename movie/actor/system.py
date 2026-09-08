@@ -54,6 +54,15 @@ class ActorSystem(ActorRef[MessageType], Protocol):
 
     class Restart: ...
 
+    class ControlMessage:
+        """Internal extension control record delivered ahead of user messages."""
+
+        def applies_to(self, behavior: object) -> bool:
+            return True
+
+        def deliver(self, behavior: object, context: object) -> None:
+            behavior.on_signal(context, self)
+
     @dataclass(frozen=True)
     class Terminated:
         """
@@ -81,6 +90,7 @@ class ActorSystem(ActorRef[MessageType], Protocol):
         Stop,
         Terminate,
         Restart,
+        ControlMessage,
     ]
 
     _impl: "type[ActorSystem] | None" = None
